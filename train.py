@@ -1,5 +1,6 @@
 import pandas as pd
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -41,7 +42,6 @@ def get_loaders(data_path, batch_size=64):
     
     return train_loader, val_loader, X_train.shape[1]
 
-import torch.nn as nn
 
 class TitanicMLP(nn.Module):
     def __init__(self, input_dim):
@@ -95,8 +95,8 @@ def evaluate(model, loader, criterion, device):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Инициализация пайплайна (укажите ваш путь к train.csv)
-    train_loader, val_loader, input_dim = get_loaders("train.csv")
+    # Инициализация пайплайна
+    train_loader, val_loader, input_dim = get_loaders("data/train.csv")
     
     model = TitanicMLP(input_dim).to(device)
     criterion = nn.BCEWithLogitsLoss()
