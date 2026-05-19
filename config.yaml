@@ -1,0 +1,25 @@
+# Настройки эксперимента Titanic (OmegaConf)
+
+paths:
+  train_csv: data/train.csv
+  test_csv: data/test.csv
+  submission_csv: submission.csv
+
+train:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  batch_size: 64
+  max_epochs: 100
+  early_stopping_patience: 12
+  early_stopping_min_delta: 1.0e-4
+  scheduler: plateau # plateau | cosine | none
+  scheduler_patience: 4
+  scheduler_factor: 0.5
+  use_class_weights: false
+  embedding_dim: 4
+  mlp_dropout: 0.2
+
+feature_mode: onehot # baseline | onehot | embedding
+n_splits: 5
+val_size: 0.2
+random_state: 42
