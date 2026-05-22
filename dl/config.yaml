@@ -18,8 +18,11 @@ train:
   use_class_weights: false
   embedding_dim: 4
   mlp_dropout: 0.2
+  use_amp: true # mixed precision on CUDA only
+  amp_dtype: fp16 # fp16 | bf16
 
 feature_mode: onehot # baseline | onehot | embedding
 n_splits: 5
 val_size: 0.2
+# Единый seed: sklearn split/k-fold, веса PyTorch, shuffle батчей (см. config.set_seed)
 random_state: 42

@@ -1,5 +1,24 @@
+# Shared environment for dl/ and ml/
+# Create: python -m venv .venv
+# Activate (PowerShell): .\.venv\Scripts\Activate.ps1
+
+# Deep learning (dl/)
 torch
-pandas
-numpy
-scikit-learn
-omegaconf
+
+# Core
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+omegaconf>=2.3
+joblib>=1.3
+
+# ML / EDA (ml/)
+matplotlib>=3.7
+seaborn>=0.13
+optuna>=3.5
+catboost>=1.2
+lightgbm>=4.0
+xgboost>=2.0
+
+# Notebooks (optional)
+ipykernel

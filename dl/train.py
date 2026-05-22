@@ -16,8 +16,11 @@ from omegaconf import DictConfig
 from config import (
     DEFAULT_EXPERIMENT,
     FeatureMode,
+    fold_seed,
     load_config,
     resolve_feature_mode,
+    set_seed,
+    shuffle_generator,
     train_config_label,
     with_train_overrides,
 )
@@ -148,22 +151,54 @@ def _forward(model: nn.Module, batch, device: torch.device):
     return model(x.to(device)), y.to(device)
 
 
+def _resolve_amp_dtype(cfg: DictConfig) -> torch.dtype:
+    dtype = str(getattr(cfg, "amp_dtype", "fp16")).lower()
+    if dtype in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    return torch.float16
+
+
+def _use_amp(cfg: DictConfig, device: torch.device) -> bool:
+    return bool(getattr(cfg, "use_amp", False)) and device.type == "cuda"
+
+
+def _make_grad_scaler(use_amp: bool):
+    try:
+        return torch.amp.GradScaler("cuda", enabled=use_amp)
+    except Exception:
+        return torch.cuda.amp.GradScaler(enabled=use_amp)
+
+
 def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    *,
+    use_amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+    scaler=None,
 ) -> float:
     model.train()
     total_loss = 0.0
     n = 0
     for batch in loader:
         optimizer.zero_grad()
-        out, y = _forward(model, batch, device)
-        loss = criterion(out, y)
-        loss.backward()
-        optimizer.step()
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=use_amp,
+        ):
+            out, y = _forward(model, batch, device)
+            loss = criterion(out, y)
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
         total_loss += loss.item() * y.size(0)
         n += y.size(0)
     return total_loss / n
@@ -175,14 +210,22 @@ def evaluate(
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
+    *,
+    use_amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
     correct = 0
     n = 0
     for batch in loader:
-        out, y = _forward(model, batch, device)
-        loss = criterion(out, y)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=use_amp,
+        ):
+            out, y = _forward(model, batch, device)
+            loss = criterion(out, y)
         total_loss += loss.item() * y.size(0)
         preds = (torch.sigmoid(out) > 0.5).float()
         correct += (preds == y).sum().item()
@@ -228,16 +271,27 @@ def _step_scheduler(scheduler, val_loss: float) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _train_dataloader(
+    dataset: Dataset,
+    batch_size: int,
+    seed: int,
+) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=shuffle_generator(seed),
+    )
+
+
 def _make_loaders_from_baseline(
-    data: BaselineFoldData, batch_size: int
+    data: BaselineFoldData, batch_size: int, seed: int
 ) -> tuple[DataLoader, DataLoader, np.ndarray, np.ndarray]:
     scaler = StandardScaler()
     X_tr = scaler.fit_transform(data.X_train.values)
     X_va = scaler.transform(data.X_val.values)
-    train_loader = DataLoader(
-        MatrixDataset(X_tr, data.y_train),
-        batch_size=batch_size,
-        shuffle=True,
+    train_loader = _train_dataloader(
+        MatrixDataset(X_tr, data.y_train), batch_size, seed
     )
     val_loader = DataLoader(
         MatrixDataset(X_va, data.y_val),
@@ -248,15 +302,13 @@ def _make_loaders_from_baseline(
 
 
 def _make_loaders_from_onehot(
-    data: OneHotFoldData, batch_size: int
+    data: OneHotFoldData, batch_size: int, seed: int
 ) -> tuple[DataLoader, DataLoader, np.ndarray, np.ndarray]:
     scaler = StandardScaler()
     X_tr = scaler.fit_transform(data.X_train.values)
     X_va = scaler.transform(data.X_val.values)
-    train_loader = DataLoader(
-        MatrixDataset(X_tr, data.y_train),
-        batch_size=batch_size,
-        shuffle=True,
+    train_loader = _train_dataloader(
+        MatrixDataset(X_tr, data.y_train), batch_size, seed
     )
     val_loader = DataLoader(
         MatrixDataset(X_va, data.y_val),
@@ -267,15 +319,15 @@ def _make_loaders_from_onehot(
 
 
 def _make_loaders_from_embedding(
-    data: EmbeddingFoldData, batch_size: int
+    data: EmbeddingFoldData, batch_size: int, seed: int
 ) -> tuple[DataLoader, DataLoader]:
     scaler = StandardScaler()
     num_tr = scaler.fit_transform(data.num_train)
     num_va = scaler.transform(data.num_val)
-    train_loader = DataLoader(
+    train_loader = _train_dataloader(
         TabularDataset(data.cat_train, num_tr, data.y_train),
-        batch_size=batch_size,
-        shuffle=True,
+        batch_size,
+        seed,
     )
     val_loader = DataLoader(
         TabularDataset(data.cat_val, num_va, data.y_val),
@@ -297,29 +349,28 @@ def prepare_fold(
     builder: FeatureBuilder,
     train_cfg: DictConfig,
 ) -> tuple[DataLoader, DataLoader, nn.Module, pd.Series]:
+    seed = fold_seed(random_state, fold)
+    set_seed(seed)
     fold_data = builder.build_fold(df, train_idx, val_idx, mode)
 
     if isinstance(fold_data, BaselineFoldData):
         train_loader, val_loader, X_tr, _ = _make_loaders_from_baseline(
-            fold_data, batch_size
+            fold_data, batch_size, seed
         )
-        torch.manual_seed(random_state + fold)
         model = TitanicMLP(X_tr.shape[1], dropout=train_cfg.mlp_dropout).to(device)
         return train_loader, val_loader, model, fold_data.y_train
 
     if isinstance(fold_data, OneHotFoldData):
         train_loader, val_loader, X_tr, _ = _make_loaders_from_onehot(
-            fold_data, batch_size
+            fold_data, batch_size, seed
         )
-        torch.manual_seed(random_state + fold)
         model = TitanicMLP(X_tr.shape[1], dropout=train_cfg.mlp_dropout).to(device)
         return train_loader, val_loader, model, fold_data.y_train
 
     if isinstance(fold_data, EmbeddingFoldData):
         train_loader, val_loader = _make_loaders_from_embedding(
-            fold_data, batch_size
+            fold_data, batch_size, seed
         )
-        torch.manual_seed(random_state + fold)
         n_cont = len(builder.cfg.cont_cols)
         model = TitanicEmbeddingMLP(
             fold_data.cardinalities,
@@ -346,6 +397,9 @@ def train_fold(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
     scheduler = make_scheduler(optimizer, cfg)
+    use_amp = _use_amp(cfg, device)
+    amp_dtype = _resolve_amp_dtype(cfg)
+    scaler = _make_grad_scaler(use_amp)
 
     best_val_loss = float("inf")
     best_state = None
@@ -353,8 +407,24 @@ def train_fold(
     last_val_loss, last_val_acc = 0.0, 0.0
 
     for epoch in range(1, cfg.max_epochs + 1):
-        train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+        train_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
+        )
+        val_loss, val_acc = evaluate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+        )
         _step_scheduler(scheduler, val_loss)
 
         if val_loss < best_val_loss - cfg.early_stopping_min_delta:
@@ -379,7 +449,12 @@ def train_fold(
     if best_state is not None:
         model.load_state_dict(best_state)
         last_val_loss, last_val_acc = evaluate(
-            model, val_loader, criterion, device
+            model,
+            val_loader,
+            criterion,
+            device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
         )
 
     return last_val_loss, last_val_acc, epoch
@@ -410,6 +485,7 @@ def stratified_kfold_cv(
     train_cfg = train_config or exp.train
     builder = FeatureBuilder()
 
+    set_seed(exp.random_state)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     df = builder.read_raw(path)
     y = df[builder.cfg.target_col]
@@ -506,16 +582,18 @@ def get_loaders(
         stratify=y,
     )
 
+    seed = fold_seed(exp.random_state)
+    set_seed(seed)
     fold_data = builder.build_fold(df, tr_idx, va_idx, mode)
 
     if isinstance(fold_data, EmbeddingFoldData):
         scaler = StandardScaler()
         num_tr = scaler.fit_transform(fold_data.num_train)
         num_va = scaler.transform(fold_data.num_val)
-        train_loader = DataLoader(
+        train_loader = _train_dataloader(
             TabularDataset(fold_data.cat_train, num_tr, fold_data.y_train),
-            batch_size=batch_size,
-            shuffle=True,
+            batch_size,
+            seed,
         )
         val_loader = DataLoader(
             TabularDataset(fold_data.cat_val, num_va, fold_data.y_val),
@@ -533,10 +611,8 @@ def get_loaders(
         scaler = StandardScaler()
         X_tr = scaler.fit_transform(fold_data.X_train.values)
         X_va = scaler.transform(fold_data.X_val.values)
-        train_loader = DataLoader(
-            MatrixDataset(X_tr, fold_data.y_train),
-            batch_size=batch_size,
-            shuffle=True,
+        train_loader = _train_dataloader(
+            MatrixDataset(X_tr, fold_data.y_train), batch_size, seed
         )
         val_loader = DataLoader(
             MatrixDataset(X_va, fold_data.y_val),
@@ -615,6 +691,7 @@ def hyperparameter_grid_search(
 
 if __name__ == "__main__":
     exp = DEFAULT_EXPERIMENT
+    set_seed(exp.random_state)
     train_cfg = exp.train
     mode = resolve_feature_mode(None, exp)
     mode_label = _MODE_LABELS.get(mode, mode.value)

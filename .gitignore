@@ -1,0 +1,54 @@
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+
+# --- Tooling ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- IDE / OS ---
+.idea/
+.vscode/*.code-workspace
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Secrets ---
+.env
+.env.*
+
+# --- Generated (ml/ & dl/) ---
+# Pipeline outputs: EDA plots, CV results, Optuna best params
+**/outputs/
+
+# Kaggle submission CSV (regenerate via main.py / create_submission.py)
+**/submission.csv
+
+# Boosting libs (created in CWD during train/tune)
+catboost_info/
+lightgbm_log/
+
+# Model checkpoints (if saved later)
+*.pt
+*.pth
+*.pkl
+*.joblib

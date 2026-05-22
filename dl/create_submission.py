@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import torch
@@ -16,8 +15,10 @@ from omegaconf import DictConfig
 from config import (
     DEFAULT_EXPERIMENT,
     FeatureMode,
+    fold_seed,
     load_config,
     resolve_feature_mode,
+    set_seed,
 )
 from feature_engineering import (
     FeatureBuilder,
@@ -29,10 +30,14 @@ from train import (
     TabularDataset,
     TitanicEmbeddingMLP,
     TitanicMLP,
+    _train_dataloader,
     make_criterion,
     make_scheduler,
     train_epoch,
     train_fold,
+    _resolve_amp_dtype,
+    _make_grad_scaler,
+    _use_amp,
     _step_scheduler,
 )
 
@@ -114,9 +119,21 @@ def _train_fixed_epochs(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
     scheduler = make_scheduler(optimizer, cfg)
+    use_amp = _use_amp(cfg, device)
+    amp_dtype = _resolve_amp_dtype(cfg)
+    scaler = _make_grad_scaler(use_amp)
 
     for epoch in range(1, epochs + 1):
-        train_epoch(model, train_loader, criterion, optimizer, device)
+        train_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
+        )
         if cfg.scheduler == "cosine" and scheduler is not None:
             _step_scheduler(scheduler, 0.0)
         elif cfg.scheduler == "plateau":
@@ -146,25 +163,25 @@ def train_and_predict_onehot(
     y_tr = data.y_train.iloc[tr_idx]
     y_va = data.y_train.iloc[va_idx]
 
-    holdout_train = DataLoader(
-        MatrixDataset(X_tr, y_tr), batch_size=cfg.batch_size, shuffle=True
+    holdout_seed = fold_seed(random_state)
+    set_seed(holdout_seed)
+    holdout_train = _train_dataloader(
+        MatrixDataset(X_tr, y_tr), cfg.batch_size, holdout_seed
     )
     holdout_val = DataLoader(
         MatrixDataset(X_va, y_va), batch_size=cfg.batch_size, shuffle=False
     )
 
-    torch.manual_seed(random_state)
     model = TitanicMLP(X_all.shape[1], dropout=cfg.mlp_dropout).to(device)
     best_epochs = _fit_holdout_epochs(
         model, holdout_train, holdout_val, y_tr, device, cfg
     )
 
-    torch.manual_seed(random_state)
+    final_seed = fold_seed(random_state, fold=1)
+    set_seed(final_seed)
     final_model = TitanicMLP(X_all.shape[1], dropout=cfg.mlp_dropout).to(device)
-    full_loader = DataLoader(
-        MatrixDataset(X_all, data.y_train),
-        batch_size=cfg.batch_size,
-        shuffle=True,
+    full_loader = _train_dataloader(
+        MatrixDataset(X_all, data.y_train), cfg.batch_size, final_seed
     )
     _train_fixed_epochs(
         final_model, full_loader, data.y_train, device, cfg, best_epochs
@@ -191,10 +208,14 @@ def train_and_predict_embedding(
     num_all = scaler.fit_transform(data.num_train)
     num_test = scaler.transform(data.num_test)
 
-    holdout_train = DataLoader(
-        TabularDataset(data.cat_train[tr_idx], num_all[tr_idx], data.y_train.iloc[tr_idx]),
-        batch_size=cfg.batch_size,
-        shuffle=True,
+    holdout_seed = fold_seed(random_state)
+    set_seed(holdout_seed)
+    holdout_train = _train_dataloader(
+        TabularDataset(
+            data.cat_train[tr_idx], num_all[tr_idx], data.y_train.iloc[tr_idx]
+        ),
+        cfg.batch_size,
+        holdout_seed,
     )
     holdout_val = DataLoader(
         TabularDataset(data.cat_train[va_idx], num_all[va_idx], data.y_train.iloc[va_idx]),
@@ -203,7 +224,6 @@ def train_and_predict_embedding(
     )
 
     n_cont = num_all.shape[1]
-    torch.manual_seed(random_state)
     model = TitanicEmbeddingMLP(
         data.cardinalities,
         n_cont,
@@ -214,17 +234,18 @@ def train_and_predict_embedding(
         model, holdout_train, holdout_val, data.y_train.iloc[tr_idx], device, cfg
     )
 
-    torch.manual_seed(random_state)
+    final_seed = fold_seed(random_state, fold=1)
+    set_seed(final_seed)
     final_model = TitanicEmbeddingMLP(
         data.cardinalities,
         n_cont,
         emb_dim=cfg.embedding_dim,
         dropout=cfg.mlp_dropout,
     ).to(device)
-    full_loader = DataLoader(
+    full_loader = _train_dataloader(
         TabularDataset(data.cat_train, num_all, data.y_train),
-        batch_size=cfg.batch_size,
-        shuffle=True,
+        cfg.batch_size,
+        final_seed,
     )
     _train_fixed_epochs(
         final_model, full_loader, data.y_train, device, cfg, best_epochs
@@ -241,6 +262,7 @@ def create_submission(
     feature_mode: FeatureMode | str | None = None,
 ) -> Path:
     exp = experiment or DEFAULT_EXPERIMENT
+    set_seed(exp.random_state)
     mode = resolve_feature_mode(feature_mode, exp)
     out_path = Path(output_path or exp.paths.submission_csv)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

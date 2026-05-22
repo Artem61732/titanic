@@ -1,0 +1,95 @@
+# Titanic ML pipeline (OmegaConf)
+
+paths:
+  train_csv: data/train.csv
+  test_csv: data/test.csv
+  submission_csv: submission.csv
+  results_dir: outputs
+  eda_dir: outputs/eda
+  tune_dir: outputs/tune
+
+experiment:
+  random_state: 42
+  n_splits: 5
+  # Сравнение 1 vs 5 фолдов (план валидации)
+  compare_n_splits: [1, 5]
+  metric: accuracy
+  quick: false # true — меньше моделей/гридов для smoke-test
+
+features:
+  # baseline: расширенный FE (Age по Title+Pclass, IsWoman/Child, Ticket, Surname rate)
+  # onehot: + укрупнённый DeckCoarse, LogFare, FareBin
+  mode: onehot # baseline | onehot | label
+  scale: true
+  drop_constant: true
+  drop_correlated: true
+  correlated_threshold: 0.95
+  clip_outliers: true
+  outlier_iqr: 1.5
+
+preprocess_ablation:
+  enabled: true
+  probe_model: logistic_l2
+
+models:
+  enabled:
+    - logistic
+    - logistic_l1
+    - logistic_l2
+    - logistic_elasticnet
+    - knn
+    - decision_tree
+    - random_forest
+    - catboost
+    - lightgbm
+    - xgboost
+  logistic_c_grid: [0.01, 0.1, 1.0, 10.0]
+  elasticnet_l1_ratio_grid: [0.2, 0.5, 0.8]
+  knn:
+    n_neighbors: [3, 5, 7, 11, 15, 21]
+    weights: [uniform, distance]
+    metrics: [euclidean, manhattan, minkowski]
+  decision_tree:
+    max_depth: [3, 5, 7, 10, null]
+    min_samples_leaf: [1, 3, 5, 10]
+  random_forest:
+    n_estimators: [100, 300, 500]
+    max_depth: [5, 8, 12, null]
+    min_samples_leaf: [1, 3, 5]
+    max_features: [sqrt, log2]
+  catboost:
+    iterations: [300, 600]
+    depth: [4, 6, 8]
+    learning_rate: [0.03, 0.1]
+    l2_leaf_reg: [1, 3, 5]
+  lightgbm:
+    n_estimators: [200, 400]
+    num_leaves: [15, 31, 63]
+    learning_rate: [0.03, 0.1]
+    min_child_samples: [5, 20]
+  xgboost:
+    n_estimators: [200, 400]
+    max_depth: [3, 5, 7]
+    learning_rate: [0.03, 0.1]
+    subsample: [0.8, 1.0]
+
+tune:
+  enabled: true
+  n_trials: 40
+  timeout_sec: null
+  models: [catboost, lightgbm, xgboost, random_forest]
+  cv_folds: 5
+
+ensemble:
+  enabled: true
+  top_k: 5
+  methods: [average, voting, stacking_lr, stacking_ridge]
+
+submission:
+  # best_cv | tuned | ensemble_voting | logistic_l2 (явная спецификация ниже)
+  model: logistic_l2
+  feature_mode: baseline # baseline | onehot | label | null → features.mode
+  logistic:
+    penalty: l2 # l2 | l1 | elasticnet
+    C: 0.1
+    l1_ratio: 0.5 # только для elasticnet

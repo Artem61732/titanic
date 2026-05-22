@@ -6,9 +6,41 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import random
+
+import numpy as np
+import torch
 from omegaconf import DictConfig, OmegaConf
 
 CONFIG_YAML = Path(__file__).with_name("config.yaml")
+
+
+def fold_seed(base: int, fold: int = 0) -> int:
+    """Один random_state в конфиге; для k-fold: base + номер фолда."""
+    return int(base) + int(fold)
+
+
+def set_seed(seed: int, *, deterministic: bool = True) -> None:
+    """
+    Синхронизирует генераторы Python / NumPy / PyTorch (и CUDA при наличии).
+    deterministic=True: стабильнее на GPU, может быть чуть медленнее.
+    """
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def shuffle_generator(seed: int) -> torch.Generator:
+    """Для DataLoader(shuffle=True) — воспроизводимый порядок батчей."""
+    gen = torch.Generator()
+    gen.manual_seed(int(seed))
+    return gen
 
 
 class FeatureMode(str, Enum):
@@ -44,10 +76,13 @@ def resolve_feature_mode(mode: FeatureMode | str | None, cfg: DictConfig) -> Fea
 
 
 def train_config_label(train_cfg: DictConfig) -> str:
+    amp_suffix = ""
+    if bool(getattr(train_cfg, "use_amp", False)):
+        amp_suffix = f" amp={getattr(train_cfg, 'amp_dtype', 'fp16')}"
     return (
         f"lr={train_cfg.lr:g} wd={train_cfg.weight_decay:g} "
         f"bs={train_cfg.batch_size} sched={train_cfg.scheduler} "
-        f"cw={train_cfg.use_class_weights}"
+        f"cw={train_cfg.use_class_weights}{amp_suffix}"
     )
 
 
