@@ -3,10 +3,9 @@ Titanic Kaggle — классический ML пайплайн.
 
 Запуск из папки ml:
   python main.py --stage all
-  python main.py --stage eda
   python main.py --stage models
   python main.py --stage tune
-  python main.py --stage submit
+  python create_submission.py
 """
 
 from __future__ import annotations
@@ -19,10 +18,8 @@ from itertools import product
 from pathlib import Path
 from typing import Any, Iterator
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 from omegaconf import DictConfig, OmegaConf
 from sklearn.base import clone
 from sklearn.ensemble import (
@@ -32,12 +29,15 @@ from sklearn.ensemble import (
 )
 from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.metrics import accuracy_score
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import (
+    RepeatedStratifiedKFold,
+    StratifiedKFold,
+    train_test_split,
+)
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier
 
 from feature_engineering import FeatureBuilder
-from tune import build_model_from_params, run_optuna_studies
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -69,6 +69,10 @@ class ModelResult:
     val_acc_std: float
     fold_scores: list[float]
     stage: str = "cv"
+    pred_positive_rate_mean: float = 0.0
+    target_rate: float = 0.0
+    calibration_error: float = 0.0
+    cv_scheme: str = "kfold"
 
 
 class ResultsTracker:
@@ -116,68 +120,154 @@ class ResultsTracker:
         return df.head(top)
 
 
+def _rs(cfg: DictConfig) -> int:
+    return int(cfg.experiment.random_state)
+
+
 # ---------------------------------------------------------------------------
-# EDA (п.1)
+# Validation (п.3): CV-схемы и калибровка
 # ---------------------------------------------------------------------------
 
 
-def run_eda(cfg: DictConfig) -> None:
-    builder = FeatureBuilder()
-    df = builder.read_raw(cfg.paths.train_csv)
-    eda_dir = Path(cfg.paths.eda_dir)
-    eda_dir.mkdir(parents=True, exist_ok=True)
+@dataclass(frozen=True)
+class CVSplit:
+    train_idx: np.ndarray
+    val_idx: np.ndarray
+    fold_id: int
+    repeat_id: int
+    scheme: str
 
-    print("=== EDA: basic stats ===")
-    print(df.describe(include="all").T.head(20))
-    print("\nMissing values:")
-    print(df.isna().sum())
-    print("\nTarget distribution:")
-    print(df["Survived"].value_counts(normalize=True))
 
-    sns.set_theme(style="whitegrid")
+@dataclass
+class CVMetrics:
+    accuracy_mean: float
+    accuracy_std: float
+    fold_scores: list[float]
+    pred_positive_rate_mean: float
+    pred_positive_rate_std: float
+    fold_pred_rates: list[float]
+    target_rate: float
+    calibration_error: float
+    n_evaluations: int
+    scheme: str
 
-    fig, ax = plt.subplots(figsize=(5, 4))
-    df["Survived"].value_counts().plot(kind="bar", ax=ax, color=["#c44e52", "#55a868"])
-    ax.set_title("Survived distribution")
-    ax.set_xlabel("Survived")
-    fig.tight_layout()
-    fig.savefig(eda_dir / "target_distribution.png", dpi=120)
-    plt.close(fig)
 
-    num_cols = ["Age", "Fare", "SibSp", "Parch"]
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
-    for ax, col in zip(axes.ravel(), num_cols):
-        df[col].dropna().hist(ax=ax, bins=30, edgecolor="black", alpha=0.7)
-        ax.set_title(col)
-    fig.suptitle("Numeric feature distributions")
-    fig.tight_layout()
-    fig.savefig(eda_dir / "numeric_histograms.png", dpi=120)
-    plt.close(fig)
+def target_survival_rate(y: pd.Series, cfg: DictConfig) -> float:
+    v = cfg.validation.get("target_survival_rate")
+    if v is not None:
+        return float(v)
+    return float(y.mean())
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    sns.countplot(data=df, x="Sex", hue="Survived", ax=ax)
-    ax.set_title("Survival by Sex")
-    fig.tight_layout()
-    fig.savefig(eda_dir / "survival_by_sex.png", dpi=120)
-    plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    sns.countplot(data=df, x="Pclass", hue="Survived", ax=ax)
-    ax.set_title("Survival by Pclass")
-    fig.tight_layout()
-    fig.savefig(eda_dir / "survival_by_pclass.png", dpi=120)
-    plt.close(fig)
+def iter_cv_splits(
+    y: pd.Series,
+    cfg: DictConfig,
+    scheme: str,
+) -> Iterator[CVSplit]:
+    """Генератор сплитов: holdout | kfold | repeated_kfold."""
+    rs = int(cfg.experiment.random_state)
+    n = len(y)
+    idx = np.arange(n)
 
-    feat = builder.featurize(df)
-    corr = feat.select_dtypes(include=[np.number]).corr()
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sns.heatmap(corr, annot=False, cmap="coolwarm", center=0, ax=ax)
-    ax.set_title("Correlation (engineered numeric)")
-    fig.tight_layout()
-    fig.savefig(eda_dir / "correlation_heatmap.png", dpi=120)
-    plt.close(fig)
+    if scheme == "holdout":
+        holdout = float(cfg.validation.get("holdout_size", 0.2))
+        train_idx, val_idx = train_test_split(
+            idx,
+            test_size=holdout,
+            random_state=rs,
+            stratify=y,
+        )
+        yield CVSplit(train_idx, val_idx, fold_id=1, repeat_id=0, scheme=scheme)
+        return
 
-    print(f"EDA plots -> {eda_dir}")
+    n_splits = int(
+        cfg.validation.get("n_splits", cfg.experiment.get("n_splits", 5))
+    )
+
+    if scheme == "kfold":
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=rs)
+        for fold_id, (train_idx, val_idx) in enumerate(skf.split(idx, y), start=1):
+            yield CVSplit(train_idx, val_idx, fold_id=fold_id, repeat_id=0, scheme=scheme)
+        return
+
+    if scheme == "repeated_kfold":
+        n_repeats = int(cfg.validation.get("n_repeats", 10))
+        rskf = RepeatedStratifiedKFold(
+            n_splits=n_splits,
+            n_repeats=n_repeats,
+            random_state=rs,
+        )
+        for i, (train_idx, val_idx) in enumerate(rskf.split(idx, y), start=1):
+            repeat_id = (i - 1) // n_splits + 1
+            fold_id = (i - 1) % n_splits + 1
+            yield CVSplit(
+                train_idx, val_idx,
+                fold_id=fold_id,
+                repeat_id=repeat_id,
+                scheme=scheme,
+            )
+        return
+
+    raise ValueError(f"Unknown CV scheme: {scheme!r}")
+
+
+def evaluate_cv(
+    model_factory: Any,
+    df: pd.DataFrame,
+    y: pd.Series,
+    cfg: DictConfig,
+    scheme: str,
+    *,
+    build_fold_fn: Any,
+    feature_mode: str,
+    feature_kwargs: dict[str, Any],
+    clone_model: Any,
+) -> CVMetrics:
+    fold_scores: list[float] = []
+    fold_pred_rates: list[float] = []
+    tgt_rate = target_survival_rate(y, cfg)
+
+    for split in iter_cv_splits(y, cfg, scheme):
+        fold = build_fold_fn(
+            df, split.train_idx, split.val_idx, feature_mode, **feature_kwargs
+        )
+        model = (
+            clone_model(model_factory)
+            if callable(model_factory)
+            else clone_model(model_factory)
+        )
+        model.fit(fold.X_train, fold.y_train)
+        pred = model.predict(fold.X_val)
+        fold_scores.append(float(accuracy_score(fold.y_val, pred)))
+        fold_pred_rates.append(float(np.mean(pred)))
+
+    n = len(fold_scores)
+    acc_std = float(np.std(fold_scores, ddof=1)) if n > 1 else 0.0
+    pred_std = float(np.std(fold_pred_rates, ddof=1)) if n > 1 else 0.0
+    pred_mean = float(np.mean(fold_pred_rates))
+    cal_err = abs(pred_mean - tgt_rate)
+
+    return CVMetrics(
+        accuracy_mean=float(np.mean(fold_scores)),
+        accuracy_std=acc_std,
+        fold_scores=fold_scores,
+        pred_positive_rate_mean=pred_mean,
+        pred_positive_rate_std=pred_std,
+        fold_pred_rates=fold_pred_rates,
+        target_rate=tgt_rate,
+        calibration_error=cal_err,
+        n_evaluations=n,
+        scheme=scheme,
+    )
+
+
+def calibration_status(cal_error: float, cfg: DictConfig) -> str:
+    tol = float(cfg.validation.get("calibration_tolerance", 0.05))
+    if cal_error <= tol:
+        return "ok"
+    if cal_error <= tol * 2:
+        return "warn"
+    return "poor"
 
 
 # ---------------------------------------------------------------------------
@@ -197,59 +287,202 @@ def _feature_kwargs(cfg: DictConfig) -> dict[str, Any]:
     }
 
 
+def _cv_metrics_to_result(
+    metrics: CVMetrics,
+    name: str,
+    params: str,
+    stage: str,
+) -> ModelResult:
+    n_splits = metrics.n_evaluations
+    return ModelResult(
+        name=name,
+        params=params,
+        n_splits=n_splits,
+        val_acc_mean=metrics.accuracy_mean,
+        val_acc_std=metrics.accuracy_std,
+        fold_scores=metrics.fold_scores,
+        stage=stage,
+        pred_positive_rate_mean=metrics.pred_positive_rate_mean,
+        target_rate=metrics.target_rate,
+        calibration_error=metrics.calibration_error,
+        cv_scheme=metrics.scheme,
+    )
+
+
 def cross_validate_model(
     model: Any,
     df: pd.DataFrame,
     cfg: DictConfig,
     *,
     n_splits: int | None = None,
+    cv_scheme: str | None = None,
     name: str = "model",
     params: str = "",
     stage: str = "cv",
 ) -> ModelResult:
     builder = FeatureBuilder()
     y = df[builder.cfg.target_col]
-    n_splits = n_splits or int(cfg.experiment.n_splits)
-    rs = int(cfg.experiment.random_state)
     mode = cfg.features.mode
     fkw = _feature_kwargs(cfg)
 
-    fold_scores: list[float] = []
+    if cv_scheme is None:
+        if n_splits == 1:
+            cv_scheme = "holdout"
+        else:
+            cv_scheme = "kfold"
 
-    if n_splits == 1:
-        idx = np.arange(len(df))
-        train_idx, val_idx = train_test_split(
-            idx,
-            test_size=0.2,
-            random_state=rs,
-            stratify=y,
-        )
-        splits = [(train_idx, val_idx)]
-    else:
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=rs)
-        splits = list(skf.split(df, y))
+    cfg_cv = cfg
+    if n_splits is not None and cv_scheme == "kfold":
+        cfg_cv = OmegaConf.merge(cfg, {"validation": {"n_splits": n_splits}})
 
-    for train_idx, val_idx in splits:
-        fold = builder.build_fold(df, train_idx, val_idx, mode, **fkw)
-        m = clone(model)
-        m.fit(fold.X_train, fold.y_train)
-        pred = m.predict(fold.X_val)
-        fold_scores.append(float(accuracy_score(fold.y_val, pred)))
-
-    mean = float(np.mean(fold_scores))
-    std = float(np.std(fold_scores, ddof=1)) if len(fold_scores) > 1 else 0.0
-    return ModelResult(name, params, n_splits, mean, std, fold_scores, stage)
+    metrics = evaluate_cv(
+        model,
+        df,
+        y,
+        cfg_cv,
+        cv_scheme,
+        build_fold_fn=builder.build_fold,
+        feature_mode=mode,
+        feature_kwargs=fkw,
+        clone_model=clone,
+    )
+    return _cv_metrics_to_result(metrics, name, params, stage)
 
 
 def compare_folds(cfg: DictConfig, model: Any, name: str, tracker: ResultsTracker) -> None:
     for n in cfg.experiment.compare_n_splits:
+        scheme = "holdout" if int(n) == 1 else "kfold"
         res = cross_validate_model(
-            model, FeatureBuilder().read_raw(cfg.paths.train_csv), cfg,
-            n_splits=int(n), name=name, params="default",
+            model,
+            FeatureBuilder().read_raw(cfg.paths.train_csv),
+            cfg,
+            n_splits=int(n) if scheme == "kfold" else None,
+            cv_scheme=scheme,
+            name=name,
+            params=f"scheme={scheme}",
             stage="fold_compare",
         )
         tracker.add(res, experiment="fold_compare")
-        print(f"  {n}-fold: {res.val_acc_mean:.4f} +/- {res.val_acc_std:.4f}")
+        print(
+            f"  {scheme} ({res.n_splits} evals): acc={res.val_acc_mean:.4f} "
+            f"+/- {res.val_acc_std:.4f} | pred_rate={res.pred_positive_rate_mean:.4f} "
+            f"| cal_err={res.calibration_error:.4f}"
+        )
+
+
+def _print_cv_metrics(metrics: CVMetrics, cfg: DictConfig, label: str) -> None:
+    status = calibration_status(metrics.calibration_error, cfg)
+    print(
+        f"  {label}: acc={metrics.accuracy_mean:.4f} +/- {metrics.accuracy_std:.4f} "
+        f"({metrics.n_evaluations} evals) | "
+        f"pred_rate={metrics.pred_positive_rate_mean:.4f} "
+        f"(target {metrics.target_rate:.4f}) | "
+        f"cal_err={metrics.calibration_error:.4f} [{status}]"
+    )
+
+
+def run_validation_suite(cfg: DictConfig, tracker: ResultsTracker) -> dict[str, Any]:
+    """п.3: hold-out vs k-fold vs repeated k-fold + калибровка."""
+    if not cfg.validation.get("enabled", True):
+        return {}
+
+    builder = FeatureBuilder()
+    df = builder.read_raw(cfg.paths.train_csv)
+    y = df[builder.cfg.target_col]
+    mode = cfg.submission.get("feature_mode") or cfg.features.mode
+    cfg_eval = OmegaConf.merge(cfg, {"features": {"mode": mode}})
+    fkw = _feature_kwargs(cfg_eval)
+    from create_submission import build_submission_model
+
+    model = build_submission_model(cfg_eval)
+
+    log_cfg = cfg_eval.submission.get("logistic") or {}
+    model_label = (
+        f"{cfg_eval.submission.model} C={log_cfg.get('C', '—')} | features={mode}"
+    )
+
+    print(f"\n=== Validation suite: {model_label} ===")
+    print(f"  Train survival rate: {target_survival_rate(y, cfg):.4f}")
+
+    schemes = list(cfg.validation.get("schemes", ["holdout", "kfold", "repeated_kfold"]))
+    if cfg.experiment.get("quick", False):
+        schemes = [s for s in schemes if s != "repeated_kfold"]
+
+    report: dict[str, Any] = {
+        "model": model_label,
+        "target_rate": float(target_survival_rate(y, cfg)),
+        "schemes": {},
+    }
+    metrics_by_scheme: dict[str, CVMetrics] = {}
+
+    for scheme in schemes:
+        cfg_scheme = cfg_eval
+        if scheme == "repeated_kfold" and cfg.experiment.get("quick", False):
+            cfg_scheme = OmegaConf.merge(cfg_eval, {"validation": {"n_repeats": 2}})
+
+        metrics = evaluate_cv(
+            model,
+            df,
+            y,
+            cfg_scheme,
+            scheme,
+            build_fold_fn=builder.build_fold,
+            feature_mode=mode,
+            feature_kwargs=fkw,
+            clone_model=clone,
+        )
+        metrics_by_scheme[scheme] = metrics
+        _print_cv_metrics(metrics, cfg, scheme)
+
+        tracker.add(
+            _cv_metrics_to_result(
+                metrics,
+                f"validation_{scheme}",
+                model_label,
+                stage="validation",
+            ),
+            cv_scheme=scheme,
+            calibration_status=calibration_status(metrics.calibration_error, cfg),
+        )
+
+        report["schemes"][scheme] = {
+            "accuracy_mean": metrics.accuracy_mean,
+            "accuracy_std": metrics.accuracy_std,
+            "n_evaluations": metrics.n_evaluations,
+            "pred_positive_rate_mean": metrics.pred_positive_rate_mean,
+            "calibration_error": metrics.calibration_error,
+            "calibration_status": calibration_status(metrics.calibration_error, cfg),
+            "fold_scores": metrics.fold_scores,
+        }
+
+    if "holdout" in metrics_by_scheme and "kfold" in metrics_by_scheme:
+        h = metrics_by_scheme["holdout"]
+        k = metrics_by_scheme["kfold"]
+        gap = k.accuracy_mean - h.accuracy_mean
+        report["holdout_vs_kfold_gap"] = gap
+        print(f"\n  Hold-out vs 5-fold gap (acc): {gap:+.4f}")
+        if abs(gap) > 0.03:
+            print("  [!] Razryv >3% — vozmozhen optimistichnyj/pessimistichnyj CV.")
+        else:
+            print("  [ok] Razryv v predelah 3% — CV stabilen.")
+
+    if "repeated_kfold" in metrics_by_scheme and "kfold" in metrics_by_scheme:
+        r = metrics_by_scheme["repeated_kfold"]
+        k = metrics_by_scheme["kfold"]
+        gap = r.accuracy_mean - k.accuracy_mean
+        report["repeated_vs_kfold_gap"] = gap
+        print(f"  Repeated ({r.n_evaluations}) vs 5-fold gap: {gap:+.4f}")
+
+    if cfg.validation.get("save_report", True):
+        out = Path(cfg.validation.get("report_path", "outputs/validation_report.json"))
+        if not out.is_absolute():
+            out = Path(__file__).resolve().parent / out
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        print(f"\n  Validation report -> {out}")
+
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -305,10 +538,6 @@ def run_preprocess_ablation(cfg: DictConfig, tracker: ResultsTracker) -> None:
 # ---------------------------------------------------------------------------
 # Model factories & grids (п.4)
 # ---------------------------------------------------------------------------
-
-
-def _rs(cfg: DictConfig) -> int:
-    return int(cfg.experiment.random_state)
 
 
 def iter_models(cfg: DictConfig) -> Iterator[tuple[str, str, Any]]:
@@ -505,7 +734,245 @@ def run_all_models(cfg: DictConfig, tracker: ResultsTracker) -> list[ModelResult
 
 
 # ---------------------------------------------------------------------------
-# Ensembles (п.6)
+# Ensembles (п.4): diverse voting + rule blend
+# ---------------------------------------------------------------------------
+
+
+def build_shallow_rf(cfg: DictConfig) -> RandomForestClassifier:
+    rf = cfg.ensemble.diverse.random_forest
+    return RandomForestClassifier(
+        n_estimators=int(rf.get("n_estimators", 200)),
+        max_depth=int(rf.get("max_depth", 5)),
+        min_samples_leaf=int(rf.get("min_samples_leaf", 5)),
+        max_features=rf.get("max_features", "sqrt"),
+        random_state=_rs(cfg),
+        n_jobs=-1,
+    )
+
+
+def build_shallow_catboost(cfg: DictConfig):
+    from catboost import CatBoostClassifier
+
+    cb = cfg.ensemble.diverse.catboost
+    return CatBoostClassifier(
+        iterations=int(cb.get("iterations", 300)),
+        depth=int(cb.get("depth", 4)),
+        learning_rate=float(cb.get("learning_rate", 0.05)),
+        l2_leaf_reg=float(cb.get("l2_leaf_reg", 3.0)),
+        verbose=0,
+        random_seed=_rs(cfg),
+        allow_writing_files=False,
+    )
+
+
+def build_diverse_estimators(cfg: DictConfig) -> list[tuple[str, Any]]:
+    from create_submission import build_logistic_from_submission_cfg
+
+    return [
+        ("logistic", build_logistic_from_submission_cfg(cfg)),
+        ("shallow_rf", build_shallow_rf(cfg)),
+        ("shallow_catboost", build_shallow_catboost(cfg)),
+    ]
+
+
+def rule_based_predictions(df_raw: pd.DataFrame, cfg: DictConfig) -> np.ndarray:
+    builder = FeatureBuilder()
+    rules = set(cfg.ensemble.rule_blend.get("use_rules", ["woman", "pclass1", "child"]))
+    feat = builder.featurize(df_raw)
+    pred = np.zeros(len(df_raw), dtype=int)
+    if "woman" in rules:
+        pred |= (df_raw["Sex"].astype(str).str.lower() == "female").values
+    if "pclass1" in rules:
+        pred |= (df_raw["Pclass"] == 1).values
+    if "child" in rules:
+        pred |= feat.apply(builder._is_child_row, axis=1).values.astype(int)
+    return pred
+
+
+def rule_based_proba(df_raw: pd.DataFrame, cfg: DictConfig) -> np.ndarray:
+    return rule_based_predictions(df_raw, cfg).astype(float)
+
+
+def _predict_proba_fold(model: Any, X: np.ndarray) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)[:, 1]
+    scores = model.decision_function(X)
+    smin, smax = scores.min(), scores.max()
+    if smax - smin < 1e-9:
+        return np.full_like(scores, 0.5, dtype=float)
+    return (scores - smin) / (smax - smin)
+
+
+def oof_predict_proba(
+    model: Any,
+    df: pd.DataFrame,
+    cfg: DictConfig,
+    *,
+    feature_mode: str | None = None,
+    feature_kwargs: dict[str, Any] | None = None,
+) -> np.ndarray:
+    builder = FeatureBuilder()
+    y = df[builder.cfg.target_col]
+    mode = feature_mode or str(cfg.features.mode)
+    fkw = feature_kwargs or {}
+    oof = np.zeros(len(df))
+    skf = StratifiedKFold(
+        n_splits=int(cfg.experiment.n_splits),
+        shuffle=True,
+        random_state=_rs(cfg),
+    )
+    for train_idx, val_idx in skf.split(df, y):
+        fold = builder.build_fold(df, train_idx, val_idx, mode, **fkw)
+        m = clone(model)
+        m.fit(fold.X_train, fold.y_train)
+        oof[val_idx] = _predict_proba_fold(m, fold.X_val)
+    return oof
+
+
+def oof_diverse_mean_proba(
+    df: pd.DataFrame,
+    cfg: DictConfig,
+    feature_kwargs: dict[str, Any],
+) -> np.ndarray:
+    mode = str(cfg.ensemble.get("feature_mode") or cfg.features.mode)
+    probas = [
+        oof_predict_proba(est, df, cfg, feature_mode=mode, feature_kwargs=feature_kwargs)
+        for _, est in build_diverse_estimators(cfg)
+    ]
+    return np.mean(np.column_stack(probas), axis=1)
+
+
+def _cv_score_from_proba(
+    y: np.ndarray, proba: np.ndarray, threshold: float = 0.5
+) -> float:
+    return float(accuracy_score(y, (proba >= threshold).astype(int)))
+
+
+def evaluate_diverse_voting(
+    df: pd.DataFrame,
+    cfg: DictConfig,
+    feature_kwargs: dict[str, Any],
+) -> tuple[float, list[float]]:
+    estimators = build_diverse_estimators(cfg)
+    vote = VotingClassifier(estimators=estimators, voting="soft")
+    builder = FeatureBuilder()
+    y = df[builder.cfg.target_col]
+    mode = str(cfg.ensemble.get("feature_mode") or cfg.features.mode)
+    metrics = evaluate_cv(
+        vote,
+        df,
+        y,
+        cfg,
+        "kfold",
+        build_fold_fn=builder.build_fold,
+        feature_mode=mode,
+        feature_kwargs=feature_kwargs,
+        clone_model=clone,
+    )
+    return metrics.accuracy_mean, metrics.fold_scores
+
+
+def evaluate_rule_only(df: pd.DataFrame, cfg: DictConfig) -> float:
+    y = df[FeatureBuilder().cfg.target_col].values
+    return float(accuracy_score(y, rule_based_predictions(df, cfg)))
+
+
+def evaluate_rule_blend_oof(
+    df: pd.DataFrame,
+    cfg: DictConfig,
+    feature_kwargs: dict[str, Any],
+) -> tuple[float, float, float]:
+    y = df[FeatureBuilder().cfg.target_col].values
+    ml_w = float(cfg.ensemble.rule_blend.get("ml_weight", 0.65))
+    rule_w = 1.0 - ml_w
+    ml_oof = oof_diverse_mean_proba(df, cfg, feature_kwargs)
+    rule = rule_based_proba(df, cfg)
+    blended = ml_w * ml_oof + rule_w * rule
+    return (
+        _cv_score_from_proba(y, blended),
+        _cv_score_from_proba(y, ml_oof),
+        float(accuracy_score(y, rule.astype(int))),
+    )
+
+
+def cv_rule_blend_by_splits(
+    df: pd.DataFrame,
+    cfg: DictConfig,
+    feature_kwargs: dict[str, Any],
+) -> tuple[float, list[float]]:
+    builder = FeatureBuilder()
+    y = df[builder.cfg.target_col]
+    mode = str(cfg.ensemble.get("feature_mode") or cfg.features.mode)
+    ml_w = float(cfg.ensemble.rule_blend.get("ml_weight", 0.65))
+    rule_w = 1.0 - ml_w
+    fold_scores: list[float] = []
+
+    for split in iter_cv_splits(y, cfg, "kfold"):
+        fold = builder.build_fold(
+            df, split.train_idx, split.val_idx, mode, **feature_kwargs
+        )
+        val_raw = df.iloc[split.val_idx]
+        rule_val = rule_based_proba(val_raw, cfg)
+        probas = []
+        for _, est in build_diverse_estimators(cfg):
+            m = clone(est)
+            m.fit(fold.X_train, fold.y_train)
+            probas.append(_predict_proba_fold(m, fold.X_val))
+        ml_val = np.mean(np.column_stack(probas), axis=1)
+        blended = ml_w * ml_val + rule_w * rule_val
+        y_val = y.iloc[split.val_idx].values
+        fold_scores.append(_cv_score_from_proba(y_val, blended))
+
+    return float(np.mean(fold_scores)), fold_scores
+
+
+def fit_predict_test(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    cfg: DictConfig,
+    feature_kwargs: dict[str, Any],
+    *,
+    method: str,
+) -> np.ndarray:
+    builder = FeatureBuilder()
+    mode = str(
+        cfg.submission.get("feature_mode")
+        or cfg.ensemble.get("feature_mode")
+        or cfg.features.mode
+    )
+    matrices = builder.build_train_test(train_df, test_df, mode, **feature_kwargs)
+
+    if method == "rule_only":
+        return rule_based_predictions(test_df, cfg)
+
+    if method == "diverse_voting":
+        vote = VotingClassifier(
+            estimators=build_diverse_estimators(cfg), voting="soft"
+        )
+        vote.fit(matrices.X_train, matrices.y_train)
+        return vote.predict(matrices.X_test).astype(int)
+
+    probas = []
+    for _, est in build_diverse_estimators(cfg):
+        m = clone(est)
+        m.fit(matrices.X_train, matrices.y_train)
+        probas.append(_predict_proba_fold(m, matrices.X_test))
+    ml_proba = np.mean(np.column_stack(probas), axis=1)
+
+    if method == "diverse_mean":
+        return (ml_proba >= 0.5).astype(int)
+
+    if method in ("rule_blend", "diverse_rule_blend"):
+        rule_test = rule_based_proba(test_df, cfg)
+        ml_w = float(cfg.ensemble.rule_blend.get("ml_weight", 0.65))
+        blended = ml_w * ml_proba + (1.0 - ml_w) * rule_test
+        return (blended >= 0.5).astype(int)
+
+    raise ValueError(f"Unknown ensemble method: {method!r}")
+
+
+# ---------------------------------------------------------------------------
+# Legacy ensembles (top-K из CV)
 # ---------------------------------------------------------------------------
 
 
@@ -565,25 +1032,102 @@ def _oof_predict_proba(
     return oof
 
 
+def _add_ensemble_result(
+    tracker: ResultsTracker,
+    name: str,
+    params: str,
+    acc: float,
+    fold_scores: list[float],
+    **extra: Any,
+) -> None:
+    std = float(np.std(fold_scores, ddof=1)) if len(fold_scores) > 1 else 0.0
+    tracker.add(
+        ModelResult(
+            name,
+            params,
+            len(fold_scores),
+            acc,
+            std,
+            fold_scores,
+            stage="ensemble",
+        ),
+        **extra,
+    )
+
+
 def run_ensembles(cfg: DictConfig, tracker: ResultsTracker) -> None:
     if not cfg.ensemble.enabled:
         return
     df = FeatureBuilder().read_raw(cfg.paths.train_csv)
     y = df[FeatureBuilder().cfg.target_col].values
     rs = _rs(cfg)
+    fkw = _feature_kwargs(cfg)
+    methods = list(cfg.ensemble.methods)
+
+    print("\n=== Ensembles (p.4): diverse + rules ===")
+    print(f"  Base models: {[n for n, _ in build_diverse_estimators(cfg)]}")
+    print(f"  Feature mode: {cfg.ensemble.get('feature_mode', cfg.features.mode)}")
+
+    if "rule_only" in methods:
+        acc = evaluate_rule_only(df, cfg)
+        n_rules = len(cfg.ensemble.rule_blend.get("use_rules", []))
+        print(f"  rule_only (train acc): {acc:.4f}")
+        _add_ensemble_result(tracker, "ensemble_rule_only", f"rules={n_rules}", acc, [acc])
+
+    if "diverse_voting" in methods:
+        acc, folds = evaluate_diverse_voting(df, cfg, fkw)
+        print(f"  diverse_voting (soft LR+RF+CatBoost) CV: {acc:.4f}")
+        _add_ensemble_result(tracker, "ensemble_diverse_voting", "soft", acc, folds)
+
+    if "diverse_mean" in methods:
+        ml_oof = oof_diverse_mean_proba(df, cfg, fkw)
+        acc = float(accuracy_score(y, (ml_oof >= 0.5).astype(int)))
+        print(f"  diverse_mean OOF acc: {acc:.4f}")
+        _add_ensemble_result(tracker, "ensemble_diverse_mean", "proba_mean", acc, [acc])
+
+    if "rule_blend" in methods:
+        blend_acc, folds = cv_rule_blend_by_splits(df, cfg, fkw)
+        ml_w = float(cfg.ensemble.rule_blend.ml_weight)
+        print(f"  rule_blend CV ({ml_w:.0%} ML + {1-ml_w:.0%} rules): {blend_acc:.4f}")
+        _add_ensemble_result(
+            tracker, "ensemble_rule_blend", f"ml_weight={ml_w}", blend_acc, folds
+        )
+
+    if "diverse_rule_blend" in methods:
+        blend_acc, ml_acc, rule_acc = evaluate_rule_blend_oof(df, cfg, fkw)
+        ml_w = float(cfg.ensemble.rule_blend.ml_weight)
+        print(
+            f"  diverse_rule_blend OOF: {blend_acc:.4f} "
+            f"(ML={ml_acc:.4f}, rules={rule_acc:.4f}, ml_weight={ml_w})"
+        )
+        _add_ensemble_result(
+            tracker,
+            "ensemble_diverse_rule_blend",
+            f"ml_weight={ml_w}",
+            blend_acc,
+            [blend_acc],
+            ml_oof_acc=ml_acc,
+            rule_acc=rule_acc,
+        )
 
     lb = tracker.leaderboard(top=int(cfg.ensemble.top_k))
     if lb.empty:
-        print("No CV results for ensembles — skip.")
+        print("\n  Legacy ensembles skipped (no prior CV leaderboard).")
         return
 
     estimators: list[tuple[str, Any]] = []
-    for _, row in lb.iterrows():
+    cv_rows = pd.DataFrame(tracker.rows)
+    cv_only = cv_rows[cv_rows["stage"] == "cv"] if not cv_rows.empty else cv_rows
+    source = cv_only if not cv_only.empty else cv_rows
+    if source.empty:
+        print("\n  Legacy ensembles skipped (no CV rows).")
+        return
+    top = source.sort_values("val_acc_mean", ascending=False).head(int(cfg.ensemble.top_k))
+    for _, row in top.iterrows():
         name, est = _build_estimator_from_row(row.to_dict(), cfg)
         estimators.append((f"{name}_{len(estimators)}", est))
 
-    print(f"\n=== Ensembles ({len(estimators)} base models) ===")
-    methods = list(cfg.ensemble.methods)
+    print(f"\n=== Legacy ensembles (top-{len(estimators)} from CV) ===")
 
     if "average" in methods:
         probs = np.column_stack(
@@ -635,118 +1179,6 @@ def run_ensembles(cfg: DictConfig, tracker: ResultsTracker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Submission
-# ---------------------------------------------------------------------------
-
-
-def _best_row(tracker: ResultsTracker, prefer: str) -> dict | None:
-    if not tracker.rows:
-        return None
-    df = pd.DataFrame(tracker.rows)
-    if prefer != "best_cv":
-        sub = df[df["name"] == prefer]
-        if not sub.empty:
-            return sub.sort_values("val_acc_mean", ascending=False).iloc[0].to_dict()
-    cv = df[df["stage"] == "cv"]
-    if cv.empty:
-        cv = df
-    return cv.sort_values("val_acc_mean", ascending=False).iloc[0].to_dict()
-
-
-def _model_from_tuned(cfg: DictConfig) -> Any | None:
-    summary = Path(cfg.paths.tune_dir) / "tune_summary.json"
-    if not summary.exists():
-        return None
-    with summary.open(encoding="utf-8") as f:
-        rows = json.load(f)
-    if not rows:
-        return None
-    best = max(rows, key=lambda r: r["best_value"])
-    return build_model_from_params(best["model"], best["best_params"], cfg)
-
-
-def _build_logistic_from_submission_cfg(cfg: DictConfig) -> LogisticRegression:
-    """LogisticRegression для submission по config.submission.logistic."""
-    rs = _rs(cfg)
-    log_cfg = cfg.submission.get("logistic") or {}
-    penalty = str(log_cfg.get("penalty", "l2")).lower()
-    c = float(log_cfg.get("C", 0.1))
-    max_iter = int(log_cfg.get("max_iter", 2000))
-
-    if penalty == "l1":
-        return LogisticRegression(
-            penalty="l1",
-            solver="liblinear",
-            C=c,
-            max_iter=max_iter,
-            random_state=rs,
-        )
-    if penalty == "elasticnet":
-        return LogisticRegression(
-            penalty="elasticnet",
-            solver="saga",
-            C=c,
-            l1_ratio=float(log_cfg.get("l1_ratio", 0.5)),
-            max_iter=max_iter,
-            random_state=rs,
-        )
-    # l2: sklearn 1.8+ — без penalty=, через C и l1_ratio=0
-    return LogisticRegression(C=c, l1_ratio=0.0, max_iter=max_iter, random_state=rs)
-
-
-def build_submission_model(cfg: DictConfig, tracker: ResultsTracker | None = None) -> Any:
-    prefer = str(cfg.submission.model)
-    if prefer == "tuned":
-        tuned = _model_from_tuned(cfg)
-        if tuned is not None:
-            return tuned
-        print("No tuned model found — fallback to submission.logistic.")
-        return _build_logistic_from_submission_cfg(cfg)
-    if prefer in ("logistic_l2", "logistic_l1", "logistic", "logistic_elasticnet"):
-        return _build_logistic_from_submission_cfg(cfg)
-    if tracker is not None:
-        row = _best_row(tracker, prefer)
-        if row is not None:
-            _, model = _build_estimator_from_row(row, cfg)
-            return model
-    return _build_logistic_from_submission_cfg(cfg)
-
-
-def create_submission(cfg: DictConfig, tracker: ResultsTracker) -> Path:
-    builder = FeatureBuilder()
-    train_df = builder.read_raw(cfg.paths.train_csv)
-    test_df = builder.read_raw(cfg.paths.test_csv)
-    mode = cfg.submission.get("feature_mode") or cfg.features.mode
-    fkw = _feature_kwargs(cfg)
-
-    model = build_submission_model(cfg, tracker)
-    log = cfg.submission.get("logistic") or {}
-    print(
-        f"Submission model: {cfg.submission.model} | "
-        f"features={mode} | C={log.get('C', '—')}"
-    )
-
-    matrices = builder.build_train_test(train_df, test_df, mode, **fkw)
-    model.fit(matrices.X_train, matrices.y_train)
-    preds = model.predict(matrices.X_test).astype(int)
-    train_acc = float(accuracy_score(matrices.y_train, model.predict(matrices.X_train)))
-
-    sub = pd.DataFrame(
-        {
-            "PassengerId": matrices.test_passenger_ids,
-            "Survived": preds,
-        }
-    )
-    out = Path(cfg.paths.submission_csv)
-    sub.to_csv(out, index=False)
-    print(
-        f"Submission: {out} ({len(sub)} rows) | "
-        f"train acc {train_acc:.4f} | pred rate {preds.mean():.4f}"
-    )
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -779,13 +1211,11 @@ def run_feature_mode_comparison(cfg: DictConfig, tracker: ResultsTracker) -> Non
 def run_pipeline(cfg: DictConfig, stage: str) -> None:
     tracker = ResultsTracker(cfg.paths.results_dir)
 
-    if stage in ("eda", "all"):
-        run_eda(cfg)
-
     if stage in ("preprocess", "all"):
         run_preprocess_ablation(cfg, tracker)
 
     if stage in ("validation", "all"):
+        run_validation_suite(cfg, tracker)
         run_fold_comparison(cfg, tracker)
         run_feature_mode_comparison(cfg, tracker)
 
@@ -793,6 +1223,8 @@ def run_pipeline(cfg: DictConfig, stage: str) -> None:
         run_all_models(cfg, tracker)
 
     if stage in ("tune", "all") and cfg.tune.enabled:
+        from tune import run_optuna_studies
+
         tune_results = run_optuna_studies(cfg)
         for row in tune_results:
             tracker.add(
@@ -815,6 +1247,8 @@ def run_pipeline(cfg: DictConfig, stage: str) -> None:
         tracker.leaderboard()
 
     if stage in ("submit", "all"):
+        from create_submission import create_submission
+
         create_submission(cfg, tracker)
 
 
@@ -824,7 +1258,7 @@ def parse_args() -> argparse.Namespace:
         "--stage",
         default="all",
         choices=[
-            "eda", "preprocess", "validation", "models",
+            "preprocess", "validation", "models",
             "tune", "ensemble", "submit", "all",
         ],
     )
@@ -839,4 +1273,6 @@ if __name__ == "__main__":
     if args.quick:
         config.experiment.quick = True
         config.tune.n_trials = 5
+        if "validation" in config:
+            config.validation.n_repeats = 2
     run_pipeline(config, args.stage)

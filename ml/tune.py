@@ -11,8 +11,6 @@ import optuna
 import pandas as pd
 from omegaconf import DictConfig, OmegaConf
 from sklearn.metrics import accuracy_score
-from sklearn.model_selection import StratifiedKFold
-
 from feature_engineering import FeatureBuilder
 
 
@@ -28,20 +26,34 @@ def build_objective(
     builder = FeatureBuilder()
     y = df[builder.cfg.target_col]
     feature_cfg = cfg.features
-    n_splits = int(cfg.tune.cv_folds)
-    rs = int(cfg.experiment.random_state)
+    tune_scheme = str(
+        cfg.validation.get("tune_scheme", "kfold")
+        if "validation" in cfg
+        else "kfold"
+    )
+    cfg_tune = OmegaConf.merge(
+        cfg,
+        {
+            "validation": {
+                "n_splits": int(
+                    cfg.validation.get("tune_n_splits", cfg.tune.get("cv_folds", 5))
+                    if "validation" in cfg
+                    else cfg.tune.get("cv_folds", 5)
+                ),
+            }
+        },
+    )
 
     def objective(trial: optuna.Trial) -> float:
+        from main import iter_cv_splits
+
         model = _sample_model(trial, model_name, cfg)
-        skf = StratifiedKFold(
-            n_splits=n_splits, shuffle=True, random_state=rs
-        )
         fold_scores: list[float] = []
-        for train_idx, val_idx in skf.split(df, y):
+        for split in iter_cv_splits(y, cfg_tune, tune_scheme):
             fold = builder.build_fold(
                 df,
-                train_idx,
-                val_idx,
+                split.train_idx,
+                split.val_idx,
                 feature_cfg.mode,
                 scale=feature_cfg.scale,
                 drop_constant=feature_cfg.drop_constant,
