@@ -1,9 +1,5 @@
 # Настройки эксперимента Titanic (OmegaConf)
-
-paths:
-  train_csv: data/train.csv
-  test_csv: data/test.csv
-  submission_csv: submission.csv
+# Пути к данным и артефактам — в корневом config.yaml
 
 train:
   lr: 1.0e-3

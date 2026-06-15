@@ -1,0 +1,24 @@
+# =============================================================================
+# ОБЩИЙ КОНФИГ (источник правды для ML и DL)
+# =============================================================================
+# Менять здесь:
+#   paths.*        пути к данным, сабмитам и артефактам
+#   random_state   воспроизводимость
+#   cv.n_splits    число фолдов
+#
+# ML-специфика (модели, ансамбли, tune) — в ml/config.yaml
+# DL-специфика (train, feature_mode)     — в dl/config.yaml
+# =============================================================================
+
+paths:
+  train_csv: data/train.csv
+  test_csv: data/test.csv
+  submission_csv: submission.csv
+  dl_submission_csv: submission_dl.csv
+  results_dir: outputs/ml
+  tune_dir: outputs/ml/tune
+
+random_state: 42
+
+cv:
+  n_splits: 5

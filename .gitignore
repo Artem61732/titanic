@@ -39,9 +39,13 @@ desktop.ini
 # --- Generated (ml/ & dl/) ---
 # Pipeline outputs: EDA plots, CV results, Optuna best params
 **/outputs/
+outputs/
 
 # Kaggle submission CSV (regenerate via main.py / create_submission.py)
 **/submission.csv
+**/submission_dl.csv
+submission.csv
+submission_dl.csv
 
 # Boosting libs (created in CWD during train/tune)
 catboost_info/
@@ -52,3 +56,6 @@ lightgbm_log/
 *.pth
 *.pkl
 *.joblib
+
+# --- Local reference clone / scratch ---
+_ref_house_prices/

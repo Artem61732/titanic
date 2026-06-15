@@ -6,67 +6,18 @@ import numpy as np
 import pandas as pd
 
 from config import FeatureMode
+from ml.feature_engineering import FeatureBuilder as MLFeatureBuilder
 
-
-@dataclass(frozen=True)
-class FeatureSettings:
-    """Параметры feature engineering (не в YAML)."""
-
-    target_col: str = "Survived"
-    cat_cols: tuple[str, ...] = ("Pclass", "Sex", "Embarked", "Title", "Deck")
-    cont_cols: tuple[str, ...] = (
-        "Age",
-        "SibSp",
-        "Parch",
-        "Fare",
-        "FamilySize",
-        "IsAlone",
-        "HasCabin",
-    )
-    baseline_cols: tuple[str, ...] = (
-        "Pclass",
-        "Sex",
-        "Age",
-        "SibSp",
-        "Parch",
-        "Fare",
-    )
-    sex_map: tuple[tuple[str, int], ...] = (("male", 0), ("female", 1))
-    default_embarked: str = "S"
-    rare_titles: frozenset[str] = frozenset(
-        {
-            "Lady",
-            "Countess",
-            "Capt",
-            "Col",
-            "Don",
-            "Dr",
-            "Major",
-            "Rev",
-            "Sir",
-            "Jonkheer",
-            "Dona",
-        }
-    )
-    title_aliases: tuple[tuple[str, str], ...] = (
-        ("Mlle", "Miss"),
-        ("Ms", "Miss"),
-        ("Mme", "Mrs"),
-    )
-    common_titles: frozenset[str] = frozenset({"Mr", "Mrs", "Miss", "Master"})
-    valid_deck_letters: frozenset[str] = frozenset("ABCDEFGT")
-    unknown_deck: str = "U"
-    rare_title_label: str = "Rare"
-
-
-DEFAULT_FEATURE_SETTINGS = FeatureSettings()
-
-
-@dataclass(frozen=True)
-class ImputationStats:
-    age_median: float
-    fare_median: float
-    embarked_mode: str
+_DL_CAT_COLS = ("Pclass", "Sex", "Embarked", "Title", "Deck")
+_DL_CONT_COLS = (
+    "Age",
+    "SibSp",
+    "Parch",
+    "Fare",
+    "FamilySize",
+    "IsAlone",
+    "HasCabin",
+)
 
 
 @dataclass
@@ -117,48 +68,28 @@ class TrainTestEmbedding:
 
 
 class FeatureBuilder:
-    """Пайплайн признаков с имputation только по train-части сплита."""
+    """DL matrices on top of the shared ML feature pipeline."""
 
-    def __init__(self, settings: FeatureSettings | None = None):
-        self.cfg = settings or DEFAULT_FEATURE_SETTINGS
-        self._sex_map = dict(self.cfg.sex_map)
-        self._rare_titles = self.cfg.rare_titles
-        self._common_titles = self.cfg.common_titles
-        self._title_aliases = dict(self.cfg.title_aliases)
+    def __init__(self) -> None:
+        self._ml = MLFeatureBuilder()
+        self.cfg = self._ml.cfg
 
     def read_raw(self, path: str | pd.PathLike) -> pd.DataFrame:
-        return pd.read_csv(path)
+        return self._ml.read_raw(path)
 
-    def featurize(self, df: pd.DataFrame) -> pd.DataFrame:
-        cfg = self.cfg
+    def _transform_split(
+        self, train_raw: pd.DataFrame, other_raw: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        stats = self._ml.fit_pipeline_stats(train_raw)
+        train_df = self._to_dl_frame(self._ml.transform(train_raw, stats))
+        other_df = self._to_dl_frame(self._ml.transform(other_raw, stats))
+        return train_df, other_df
+
+    def _to_dl_frame(self, df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
-        out["Title"] = out["Name"].apply(self._parse_title)
-        out["FamilySize"] = out["SibSp"] + out["Parch"] + 1
-        out["IsAlone"] = (out["FamilySize"] == 1).astype(int)
-        out["HasCabin"] = out["Cabin"].notna().astype(int)
-        out["Deck"] = out["Cabin"].apply(self._deck_from_cabin)
-        out["Sex"] = out["Sex"].map(self._sex_map)
-        return out
-
-    def imputation_stats(self, train_raw: pd.DataFrame) -> ImputationStats:
-        embarked = train_raw["Embarked"]
-        if embarked.notna().any():
-            emb_mode = embarked.dropna().mode().iloc[0]
-        else:
-            emb_mode = self.cfg.default_embarked
-        return ImputationStats(
-            age_median=float(train_raw["Age"].median()),
-            fare_median=float(train_raw["Fare"].median()),
-            embarked_mode=str(emb_mode),
-        )
-
-    def apply_imputation(
-        self, df_feat: pd.DataFrame, stats: ImputationStats
-    ) -> pd.DataFrame:
-        out = df_feat.copy()
-        out["Age"] = out["Age"].fillna(stats.age_median)
-        out["Fare"] = out["Fare"].fillna(stats.fare_median)
-        out["Embarked"] = out["Embarked"].fillna(stats.embarked_mode)
+        out["Deck"] = out["DeckCoarse"].astype(str)
+        out["Embarked"] = out["Embarked"].astype(str)
+        out["Title"] = out["Title"].astype(str)
         return out
 
     def build_fold(
@@ -168,12 +99,45 @@ class FeatureBuilder:
         val_idx: np.ndarray,
         mode: FeatureMode,
     ) -> OneHotFoldData | EmbeddingFoldData | BaselineFoldData:
+        train_raw = df.iloc[train_idx]
+        val_raw = df.iloc[val_idx]
+        y_train = df[self.cfg.target_col].iloc[train_idx]
+        y_val = df[self.cfg.target_col].iloc[val_idx]
+
         if mode == FeatureMode.BASELINE:
-            return self._build_baseline(df, train_idx, val_idx)
+            stats = self._ml.fit_pipeline_stats(train_raw)
+
+            def baseline_block(raw: pd.DataFrame) -> pd.DataFrame:
+                block = self._to_dl_frame(self._ml.transform(raw, stats))
+                return block[
+                    ["Pclass", "Sex", "Age", "SibSp", "Parch", "Fare"]
+                ].astype(float)
+
+            return BaselineFoldData(
+                X_train=baseline_block(train_raw),
+                X_val=baseline_block(val_raw),
+                y_train=y_train,
+                y_val=y_val,
+            )
+
+        tr_i, va_i = self._transform_split(train_raw, val_raw)
         if mode == FeatureMode.ONEHOT:
-            return self._build_onehot(df, train_idx, val_idx)
+            X_train, columns = self._encode_onehot(tr_i, reference_columns=None)
+            X_val, _ = self._encode_onehot(va_i, reference_columns=columns)
+            return OneHotFoldData(X_train, X_val, y_train, y_val, columns)
+
         if mode == FeatureMode.EMBEDDING:
-            return self._build_embedding(df, train_idx, val_idx)
+            vocab, cardinalities = self._fit_category_vocab(tr_i)
+            return EmbeddingFoldData(
+                self._encode_categories(tr_i, vocab),
+                self._encode_categories(va_i, vocab),
+                tr_i[list(_DL_CONT_COLS)].astype(np.float64).values,
+                va_i[list(_DL_CONT_COLS)].astype(np.float64).values,
+                y_train,
+                y_val,
+                cardinalities,
+            )
+
         raise ValueError(f"Unknown feature mode: {mode!r}")
 
     def build_train_test(
@@ -182,13 +146,7 @@ class FeatureBuilder:
         df_test: pd.DataFrame,
         mode: FeatureMode,
     ) -> TrainTestOneHot | TrainTestEmbedding:
-        """
-        Признаки для финальной модели: imputation/vocab только по train,
-        test трансформируется теми же правилами.
-        """
-        stats = self.imputation_stats(df_train)
-        tr_i = self.apply_imputation(self.featurize(df_train), stats)
-        te_i = self.apply_imputation(self.featurize(df_test), stats)
+        tr_i, te_i = self._transform_split(df_train, df_test)
         y_train = df_train[self.cfg.target_col]
         test_ids = df_test["PassengerId"]
 
@@ -204,15 +162,11 @@ class FeatureBuilder:
 
         if mode == FeatureMode.EMBEDDING:
             vocab, cardinalities = self._fit_category_vocab(tr_i)
-            cat_tr = self._encode_categories(tr_i, vocab)
-            cat_te = self._encode_categories(te_i, vocab)
-            num_tr = tr_i[list(self.cfg.cont_cols)].astype(np.float64).values
-            num_te = te_i[list(self.cfg.cont_cols)].astype(np.float64).values
             return TrainTestEmbedding(
-                cat_train=cat_tr,
-                cat_test=cat_te,
-                num_train=num_tr,
-                num_test=num_te,
+                cat_train=self._encode_categories(tr_i, vocab),
+                cat_test=self._encode_categories(te_i, vocab),
+                num_train=tr_i[list(_DL_CONT_COLS)].astype(np.float64).values,
+                num_test=te_i[list(_DL_CONT_COLS)].astype(np.float64).values,
                 y_train=y_train,
                 test_passenger_ids=test_ids,
                 cardinalities=cardinalities,
@@ -222,77 +176,15 @@ class FeatureBuilder:
             f"build_train_test supports onehot and embedding, got {mode!r}"
         )
 
-    def _labels(
-        self, df: pd.DataFrame, train_idx: np.ndarray, val_idx: np.ndarray
-    ) -> tuple[pd.Series, pd.Series]:
-        y = df[self.cfg.target_col]
-        return y.iloc[train_idx], y.iloc[val_idx]
-
-    def _prepare_imputed_splits(
-        self, df: pd.DataFrame, train_idx: np.ndarray, val_idx: np.ndarray
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        train_raw = df.iloc[train_idx]
-        val_raw = df.iloc[val_idx]
-        stats = self.imputation_stats(train_raw)
-        tr_i = self.apply_imputation(self.featurize(train_raw), stats)
-        va_i = self.apply_imputation(self.featurize(val_raw), stats)
-        return tr_i, va_i
-
-    def _build_baseline(
-        self, df: pd.DataFrame, train_idx: np.ndarray, val_idx: np.ndarray
-    ) -> BaselineFoldData:
-        train_raw = df.iloc[train_idx]
-        val_raw = df.iloc[val_idx]
-        stats = self.imputation_stats(train_raw)
-        y_train, y_val = self._labels(df, train_idx, val_idx)
-
-        def block(raw: pd.DataFrame) -> pd.DataFrame:
-            d = raw.copy()
-            d["Sex"] = d["Sex"].map(self._sex_map)
-            d["Age"] = d["Age"].fillna(stats.age_median)
-            d["Fare"] = d["Fare"].fillna(stats.fare_median)
-            return d[list(self.cfg.baseline_cols)]
-
-        return BaselineFoldData(
-            X_train=block(train_raw),
-            X_val=block(val_raw),
-            y_train=y_train,
-            y_val=y_val,
-        )
-
-    def _build_onehot(
-        self, df: pd.DataFrame, train_idx: np.ndarray, val_idx: np.ndarray
-    ) -> OneHotFoldData:
-        tr_i, va_i = self._prepare_imputed_splits(df, train_idx, val_idx)
-        y_train, y_val = self._labels(df, train_idx, val_idx)
-        X_train, columns = self._encode_onehot(tr_i, reference_columns=None)
-        X_val, _ = self._encode_onehot(va_i, reference_columns=columns)
-        return OneHotFoldData(X_train, X_val, y_train, y_val, columns)
-
-    def _build_embedding(
-        self, df: pd.DataFrame, train_idx: np.ndarray, val_idx: np.ndarray
-    ) -> EmbeddingFoldData:
-        tr_i, va_i = self._prepare_imputed_splits(df, train_idx, val_idx)
-        y_train, y_val = self._labels(df, train_idx, val_idx)
-        vocab, cardinalities = self._fit_category_vocab(tr_i)
-        cat_train = self._encode_categories(tr_i, vocab)
-        cat_val = self._encode_categories(va_i, vocab)
-        num_train = tr_i[list(self.cfg.cont_cols)].astype(np.float64).values
-        num_val = va_i[list(self.cfg.cont_cols)].astype(np.float64).values
-        return EmbeddingFoldData(
-            cat_train, cat_val, num_train, num_val, y_train, y_val, cardinalities
-        )
-
     def _encode_onehot(
         self,
         df_imputed: pd.DataFrame,
         reference_columns: list[str] | None,
     ) -> tuple[pd.DataFrame, list[str]]:
-        cfg = self.cfg
-        X_num = df_imputed[list(cfg.cont_cols)].astype(np.float64)
+        X_num = df_imputed[list(_DL_CONT_COLS)].astype(np.float64)
         dums = pd.get_dummies(
-            df_imputed[list(cfg.cat_cols)],
-            columns=list(cfg.cat_cols),
+            df_imputed[list(_DL_CAT_COLS)],
+            columns=list(_DL_CAT_COLS),
             dtype=float,
         )
         X = pd.concat(
@@ -310,7 +202,6 @@ class FeatureBuilder:
 
         vocab["Pclass"] = {1: 0, 2: 1, 3: 2}
         cardinalities.append(3)
-
         vocab["Sex"] = {0: 0, 1: 1}
         cardinalities.append(2)
 
@@ -327,7 +218,7 @@ class FeatureBuilder:
         self, df_imputed: pd.DataFrame, vocab: dict
     ) -> np.ndarray:
         n = len(df_imputed)
-        out = np.zeros((n, len(self.cfg.cat_cols)), dtype=np.int64)
+        out = np.zeros((n, len(_DL_CAT_COLS)), dtype=np.int64)
 
         pclass = df_imputed["Pclass"].astype(int)
         out[:, 0] = pclass.map(vocab["Pclass"]).fillna(0).astype(np.int64)
@@ -337,51 +228,24 @@ class FeatureBuilder:
 
         for j, col in enumerate(("Embarked", "Title", "Deck"), start=2):
             spec = vocab[col]
-            m, unk = spec["map"], spec["unk"]
+            mapping, unk = spec["map"], spec["unk"]
             out[:, j] = (
                 df_imputed[col]
                 .astype(str)
-                .map(lambda v, mapping=m, u=unk: mapping.get(v, u))
+                .map(lambda v, m=mapping, u=unk: m.get(v, u))
                 .astype(np.int64)
             )
 
         return out
 
-    def _parse_title(self, name: str) -> str:
-        cfg = self.cfg
-        try:
-            title = str(name).split(",")[1].split(".")[0].strip()
-        except (IndexError, AttributeError):
-            return cfg.rare_title_label
-        if title in self._rare_titles:
-            return cfg.rare_title_label
-        if title in self._title_aliases:
-            return self._title_aliases[title]
-        if title in self._common_titles:
-            return title
-        return cfg.rare_title_label
-
-    def _deck_from_cabin(self, cabin) -> str:
-        cfg = self.cfg
-        if pd.isna(cabin) or cabin == "":
-            return cfg.unknown_deck
-        ch = str(cabin)[0].upper()
-        if ch in self.cfg.valid_deck_letters:
-            return ch
-        return cfg.unknown_deck
-
 
 def load_baseline_xy(
     path: str | pd.PathLike,
-    settings: FeatureSettings | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Legacy: 6 признаков, глобальные медианы по всему файлу."""
-    cfg = settings or DEFAULT_FEATURE_SETTINGS
-    builder = FeatureBuilder(cfg)
+    builder = FeatureBuilder()
     df = builder.read_raw(path)
-    df["Age"] = df["Age"].fillna(df["Age"].median())
-    df["Fare"] = df["Fare"].fillna(df["Fare"].median())
-    df["Sex"] = df["Sex"].map(dict(cfg.sex_map))
-    X = df[list(cfg.baseline_cols)]
-    y = df[cfg.target_col]
+    stats = builder._ml.fit_pipeline_stats(df)
+    block = builder._to_dl_frame(builder._ml.transform(df, stats))
+    X = block[["Pclass", "Sex", "Age", "SibSp", "Parch", "Fare"]].astype(float)
+    y = df[builder.cfg.target_col]
     return X, y

@@ -13,19 +13,18 @@ from torch.utils.data import DataLoader
 from omegaconf import DictConfig
 
 from config import (
-    DEFAULT_EXPERIMENT,
     FeatureMode,
     fold_seed,
     load_config,
     resolve_feature_mode,
     set_seed,
 )
-from feature_engineering import (
+from dl.feature_engineering import (
     FeatureBuilder,
     TrainTestEmbedding,
     TrainTestOneHot,
 )
-from train import (
+from dl.train import (
     MatrixDataset,
     TabularDataset,
     TitanicEmbeddingMLP,
@@ -261,10 +260,13 @@ def create_submission(
     output_path: Path | str | None = None,
     feature_mode: FeatureMode | str | None = None,
 ) -> Path:
-    exp = experiment or DEFAULT_EXPERIMENT
+    exp = experiment if experiment is not None else load_config()
     set_seed(exp.random_state)
     mode = resolve_feature_mode(feature_mode, exp)
-    out_path = Path(output_path or exp.paths.submission_csv)
+    out_path = Path(
+        output_path
+        or exp.paths.get("dl_submission_csv", exp.paths.submission_csv)
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     builder = FeatureBuilder()
 

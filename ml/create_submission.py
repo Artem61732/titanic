@@ -7,11 +7,19 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from omegaconf import DictConfig, OmegaConf
-from sklearn.linear_model import LogisticRegression
+from omegaconf import DictConfig
 from sklearn.metrics import accuracy_score
 
-from feature_engineering import FeatureBuilder
+from ml.feature_engineering import FeatureBuilder
+from ml.main import (
+    ResultsTracker,
+    _build_estimator_from_row,
+    _feature_kwargs,
+    build_logistic_from_submission_cfg,
+    calibration_status,
+    fit_predict_test,
+    rule_based_predictions,
+)
 
 ENSEMBLE_SUBMISSION = {
     "ensemble_diverse_voting": "diverse_voting",
@@ -20,45 +28,6 @@ ENSEMBLE_SUBMISSION = {
     "ensemble_diverse_rule_blend": "diverse_rule_blend",
     "rule_only": "rule_only",
 }
-
-
-def load_config(config_path: str | Path | None = None) -> DictConfig:
-    root = Path(__file__).resolve().parent
-    path = Path(config_path) if config_path else root / "config.yaml"
-    cfg = OmegaConf.load(path)
-    for key in ("paths",):
-        if key in cfg and hasattr(cfg[key], "items"):
-            for k, v in cfg[key].items():
-                p = Path(str(v))
-                if not p.is_absolute():
-                    cfg[key][k] = str((root / p).resolve())
-    OmegaConf.resolve(cfg)
-    return cfg
-
-
-def _rs(cfg: DictConfig) -> int:
-    return int(cfg.experiment.random_state)
-
-
-def _feature_kwargs(cfg: DictConfig) -> dict[str, Any]:
-    f = cfg.features
-    return {
-        "scale": f.scale,
-        "drop_constant": f.drop_constant,
-        "drop_correlated": f.drop_correlated,
-        "correlated_threshold": f.correlated_threshold,
-        "clip_outliers": f.clip_outliers,
-        "outlier_iqr": f.outlier_iqr,
-    }
-
-
-def _calibration_status(cal_error: float, cfg: DictConfig) -> str:
-    tol = float(cfg.validation.get("calibration_tolerance", 0.05))
-    if cal_error <= tol:
-        return "ok"
-    if cal_error <= tol * 2:
-        return "warn"
-    return "poor"
 
 
 def _best_row(tracker: Any, prefer: str) -> dict | None:
@@ -76,7 +45,7 @@ def _best_row(tracker: Any, prefer: str) -> dict | None:
 
 
 def _model_from_tuned(cfg: DictConfig) -> Any | None:
-    from tune import build_model_from_params
+    from ml.tune import build_model_from_params
 
     summary = Path(cfg.paths.tune_dir) / "tune_summary.json"
     if not summary.exists():
@@ -87,33 +56,6 @@ def _model_from_tuned(cfg: DictConfig) -> Any | None:
         return None
     best = max(rows, key=lambda r: r["best_value"])
     return build_model_from_params(best["model"], best["best_params"], cfg)
-
-
-def build_logistic_from_submission_cfg(cfg: DictConfig) -> LogisticRegression:
-    rs = _rs(cfg)
-    log_cfg = cfg.submission.get("logistic") or {}
-    penalty = str(log_cfg.get("penalty", "l2")).lower()
-    c = float(log_cfg.get("C", 0.1))
-    max_iter = int(log_cfg.get("max_iter", 2000))
-
-    if penalty == "l1":
-        return LogisticRegression(
-            penalty="l1",
-            solver="liblinear",
-            C=c,
-            max_iter=max_iter,
-            random_state=rs,
-        )
-    if penalty == "elasticnet":
-        return LogisticRegression(
-            penalty="elasticnet",
-            solver="saga",
-            C=c,
-            l1_ratio=float(log_cfg.get("l1_ratio", 0.5)),
-            max_iter=max_iter,
-            random_state=rs,
-        )
-    return LogisticRegression(C=c, l1_ratio=0.0, max_iter=max_iter, random_state=rs)
 
 
 def build_submission_model(cfg: DictConfig, tracker: Any | None = None) -> Any:
@@ -129,16 +71,12 @@ def build_submission_model(cfg: DictConfig, tracker: Any | None = None) -> Any:
     if tracker is not None:
         row = _best_row(tracker, prefer)
         if row is not None:
-            from main import _build_estimator_from_row
-
             _, model = _build_estimator_from_row(row, cfg)
             return model
     return build_logistic_from_submission_cfg(cfg)
 
 
 def create_submission(cfg: DictConfig, tracker: Any | None = None) -> Path:
-    from main import fit_predict_test, rule_based_predictions
-
     builder = FeatureBuilder()
     train_df = builder.read_raw(cfg.paths.train_csv)
     test_df = builder.read_raw(cfg.paths.test_csv)
@@ -183,7 +121,7 @@ def create_submission(cfg: DictConfig, tracker: Any | None = None) -> Path:
 
     tgt_rate = float(matrices.y_train.mean())
     cal_err = abs(float(preds.mean()) - tgt_rate)
-    cal_status = _calibration_status(cal_err, cfg)
+    cal_status = calibration_status(cal_err, cfg)
 
     sub = pd.DataFrame({"PassengerId": passenger_ids, "Survived": preds})
     out = Path(cfg.paths.submission_csv)
@@ -197,7 +135,7 @@ def create_submission(cfg: DictConfig, tracker: Any | None = None) -> Path:
 
 
 if __name__ == "__main__":
-    from main import ResultsTracker
+    from config import load_config
 
     config = load_config()
     results = ResultsTracker(config.paths.results_dir)

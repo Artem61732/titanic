@@ -1,11 +1,5 @@
 # Titanic ML pipeline (OmegaConf)
-
-paths:
-  train_csv: data/train.csv
-  test_csv: data/test.csv
-  submission_csv: submission.csv
-  results_dir: outputs
-  tune_dir: outputs/tune
+# Пути к данным и артефактам — в корневом config.yaml
 
 experiment:
   random_state: 42
@@ -22,7 +16,7 @@ validation:
   holdout_size: 0.2
   target_survival_rate: null # null → доля Survived=1 в train (~0.384)
   calibration_tolerance: 0.05 # |pred_rate - target_rate| ≤ tol → ok
-  schemes: [holdout, kfold, repeated_kfold]
+  schemes: [kfold]
   save_report: true
   report_path: outputs/validation_report.json
   # для Optuna оставляем быстрый kfold (50 fold-fit на trial = долго)
@@ -41,7 +35,7 @@ features:
   outlier_iqr: 1.5
 
 preprocess_ablation:
-  enabled: true
+  enabled: false
   probe_model: logistic_l2
 
 models:
@@ -104,10 +98,6 @@ ensemble:
     - rule_blend
     - diverse_rule_blend
     - rule_only
-    - average
-    - voting
-    - stacking_lr
-    - stacking_ridge
   diverse:
     random_forest:
       n_estimators: 200

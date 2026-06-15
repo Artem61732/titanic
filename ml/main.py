@@ -1,11 +1,10 @@
 """
 Titanic Kaggle — классический ML пайплайн.
 
-Запуск из папки ml:
-  python main.py --stage all
-  python main.py --stage models
-  python main.py --stage tune
-  python create_submission.py
+Запуск из корня:
+  python main.py
+  python main.py --quick
+  python -m ml.main --stage all
 """
 
 from __future__ import annotations
@@ -22,12 +21,8 @@ import numpy as np
 import pandas as pd
 from omegaconf import DictConfig, OmegaConf
 from sklearn.base import clone
-from sklearn.ensemble import (
-    RandomForestClassifier,
-    StackingClassifier,
-    VotingClassifier,
-)
-from sklearn.linear_model import LogisticRegression, RidgeClassifier
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import (
     RepeatedStratifiedKFold,
@@ -37,27 +32,12 @@ from sklearn.model_selection import (
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier
 
-from feature_engineering import FeatureBuilder
+from ml.feature_engineering import FeatureBuilder
 
 warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# ---------------------------------------------------------------------------
 # Config & results
-# ---------------------------------------------------------------------------
-
-
-def load_config(config_path: str | Path | None = None) -> DictConfig:
-    root = Path(__file__).resolve().parent
-    path = Path(config_path) if config_path else root / "config.yaml"
-    cfg = OmegaConf.load(path)
-    for key in ("paths",):
-        if key in cfg and hasattr(cfg[key], "items"):
-            for k, v in cfg[key].items():
-                p = Path(str(v))
-                if not p.is_absolute():
-                    cfg[key][k] = str((root / p).resolve())
-    OmegaConf.resolve(cfg)
-    return cfg
 
 
 @dataclass
@@ -124,9 +104,33 @@ def _rs(cfg: DictConfig) -> int:
     return int(cfg.experiment.random_state)
 
 
-# ---------------------------------------------------------------------------
-# Validation (п.3): CV-схемы и калибровка
-# ---------------------------------------------------------------------------
+def build_logistic_from_submission_cfg(cfg: DictConfig) -> LogisticRegression:
+    log_cfg = cfg.submission.get("logistic") or {}
+    penalty = str(log_cfg.get("penalty", "l2")).lower()
+    c = float(log_cfg.get("C", 0.1))
+    max_iter = int(log_cfg.get("max_iter", 2000))
+    rs = _rs(cfg)
+
+    if penalty == "l1":
+        return LogisticRegression(
+            l1_ratio=1.0,
+            solver="liblinear",
+            C=c,
+            max_iter=max_iter,
+            random_state=rs,
+        )
+    if penalty == "elasticnet":
+        return LogisticRegression(
+            solver="saga",
+            C=c,
+            l1_ratio=float(log_cfg.get("l1_ratio", 0.5)),
+            max_iter=max_iter,
+            random_state=rs,
+        )
+    return LogisticRegression(C=c, l1_ratio=0.0, max_iter=max_iter, random_state=rs)
+
+
+# Validation
 
 
 @dataclass(frozen=True)
@@ -231,11 +235,7 @@ def evaluate_cv(
         fold = build_fold_fn(
             df, split.train_idx, split.val_idx, feature_mode, **feature_kwargs
         )
-        model = (
-            clone_model(model_factory)
-            if callable(model_factory)
-            else clone_model(model_factory)
-        )
+        model = clone_model(model_factory)
         model.fit(fold.X_train, fold.y_train)
         pred = model.predict(fold.X_val)
         fold_scores.append(float(accuracy_score(fold.y_val, pred)))
@@ -270,9 +270,7 @@ def calibration_status(cal_error: float, cfg: DictConfig) -> str:
     return "poor"
 
 
-# ---------------------------------------------------------------------------
 # CV helpers
-# ---------------------------------------------------------------------------
 
 
 def _feature_kwargs(cfg: DictConfig) -> dict[str, Any]:
@@ -349,27 +347,6 @@ def cross_validate_model(
     return _cv_metrics_to_result(metrics, name, params, stage)
 
 
-def compare_folds(cfg: DictConfig, model: Any, name: str, tracker: ResultsTracker) -> None:
-    for n in cfg.experiment.compare_n_splits:
-        scheme = "holdout" if int(n) == 1 else "kfold"
-        res = cross_validate_model(
-            model,
-            FeatureBuilder().read_raw(cfg.paths.train_csv),
-            cfg,
-            n_splits=int(n) if scheme == "kfold" else None,
-            cv_scheme=scheme,
-            name=name,
-            params=f"scheme={scheme}",
-            stage="fold_compare",
-        )
-        tracker.add(res, experiment="fold_compare")
-        print(
-            f"  {scheme} ({res.n_splits} evals): acc={res.val_acc_mean:.4f} "
-            f"+/- {res.val_acc_std:.4f} | pred_rate={res.pred_positive_rate_mean:.4f} "
-            f"| cal_err={res.calibration_error:.4f}"
-        )
-
-
 def _print_cv_metrics(metrics: CVMetrics, cfg: DictConfig, label: str) -> None:
     status = calibration_status(metrics.calibration_error, cfg)
     print(
@@ -382,7 +359,7 @@ def _print_cv_metrics(metrics: CVMetrics, cfg: DictConfig, label: str) -> None:
 
 
 def run_validation_suite(cfg: DictConfig, tracker: ResultsTracker) -> dict[str, Any]:
-    """п.3: hold-out vs k-fold vs repeated k-fold + калибровка."""
+    """hold-out vs k-fold vs repeated k-fold + calibration."""
     if not cfg.validation.get("enabled", True):
         return {}
 
@@ -392,7 +369,7 @@ def run_validation_suite(cfg: DictConfig, tracker: ResultsTracker) -> dict[str, 
     mode = cfg.submission.get("feature_mode") or cfg.features.mode
     cfg_eval = OmegaConf.merge(cfg, {"features": {"mode": mode}})
     fkw = _feature_kwargs(cfg_eval)
-    from create_submission import build_submission_model
+    from ml.create_submission import build_submission_model
 
     model = build_submission_model(cfg_eval)
 
@@ -485,14 +462,12 @@ def run_validation_suite(cfg: DictConfig, tracker: ResultsTracker) -> dict[str, 
     return report
 
 
-# ---------------------------------------------------------------------------
-# Preprocess ablation (п.2 — сравнение до/после)
-# ---------------------------------------------------------------------------
+# Preprocess ablation
 
 
 def _probe_model(cfg: DictConfig) -> LogisticRegression:
     return LogisticRegression(
-        penalty="l2", C=1.0, max_iter=2000, random_state=int(cfg.experiment.random_state)
+        l1_ratio=0.0, C=1.0, max_iter=2000, random_state=int(cfg.experiment.random_state)
     )
 
 
@@ -535,9 +510,7 @@ def run_preprocess_ablation(cfg: DictConfig, tracker: ResultsTracker) -> None:
         prev_acc = acc
 
 
-# ---------------------------------------------------------------------------
-# Model factories & grids (п.4)
-# ---------------------------------------------------------------------------
+# Model factories & grids
 
 
 def iter_models(cfg: DictConfig) -> Iterator[tuple[str, str, Any]]:
@@ -558,7 +531,7 @@ def iter_models(cfg: DictConfig) -> Iterator[tuple[str, str, Any]]:
                 "logistic_l1",
                 f"C={c}",
                 LogisticRegression(
-                    penalty="l1", solver="liblinear", C=float(c),
+                    l1_ratio=1.0, solver="liblinear", C=float(c),
                     max_iter=2000, random_state=rs,
                 ),
             )
@@ -572,7 +545,7 @@ def iter_models(cfg: DictConfig) -> Iterator[tuple[str, str, Any]]:
                 "logistic_l2",
                 f"C={c}",
                 LogisticRegression(
-                    penalty="l2", C=float(c), max_iter=2000, random_state=rs,
+                    l1_ratio=0.0, C=float(c), max_iter=2000, random_state=rs,
                 ),
             )
 
@@ -586,7 +559,6 @@ def iter_models(cfg: DictConfig) -> Iterator[tuple[str, str, Any]]:
                 "logistic_elasticnet",
                 f"C={c},l1_ratio={l1}",
                 LogisticRegression(
-                    penalty="elasticnet",
                     solver="saga",
                     C=float(c),
                     l1_ratio=float(l1),
@@ -733,9 +705,7 @@ def run_all_models(cfg: DictConfig, tracker: ResultsTracker) -> list[ModelResult
     return results
 
 
-# ---------------------------------------------------------------------------
-# Ensembles (п.4): diverse voting + rule blend
-# ---------------------------------------------------------------------------
+# Ensembles: diverse voting + rule blend
 
 
 def build_shallow_rf(cfg: DictConfig) -> RandomForestClassifier:
@@ -766,8 +736,6 @@ def build_shallow_catboost(cfg: DictConfig):
 
 
 def build_diverse_estimators(cfg: DictConfig) -> list[tuple[str, Any]]:
-    from create_submission import build_logistic_from_submission_cfg
-
     return [
         ("logistic", build_logistic_from_submission_cfg(cfg)),
         ("shallow_rf", build_shallow_rf(cfg)),
@@ -971,65 +939,113 @@ def fit_predict_test(
     raise ValueError(f"Unknown ensemble method: {method!r}")
 
 
-# ---------------------------------------------------------------------------
-# Legacy ensembles (top-K из CV)
-# ---------------------------------------------------------------------------
+
+def _parse_params(params: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for part in str(params).split(","):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            out[key.strip()] = value.strip()
+    return out
+
+
+def _nullable_int(value: str | None) -> int | None:
+    if value is None or value in {"null", "None", ""}:
+        return None
+    return int(value)
 
 
 def _build_estimator_from_row(row: dict, cfg: DictConfig) -> tuple[str, Any]:
-    """Восстановление лучших sklearn-моделей по имени (упрощённо)."""
+    """Rebuild estimator from CV/tune results row (name + params)."""
     rs = _rs(cfg)
-    name = row["name"]
+    name = str(row["name"])
+    params = str(row.get("params", ""))
+
+    if name.startswith("tuned_"):
+        from ml.tune import build_model_from_params
+
+        model_name = name.removeprefix("tuned_")
+        best_params = json.loads(params)
+        return name, build_model_from_params(model_name, best_params, cfg)
+
+    p = _parse_params(params)
+
     if name == "random_forest":
         return name, RandomForestClassifier(
-            n_estimators=300, max_depth=8, random_state=rs, n_jobs=-1
+            n_estimators=int(p.get("n", 100)),
+            max_depth=_nullable_int(p.get("d")),
+            min_samples_leaf=int(p.get("leaf", 1)),
+            max_features=p.get("mf", "sqrt"),
+            random_state=rs,
+            n_jobs=-1,
         )
     if name.startswith("logistic"):
-        return name, LogisticRegression(penalty="l2", C=1.0, max_iter=2000, random_state=rs)
+        if name == "logistic_l1":
+            return name, LogisticRegression(
+                l1_ratio=1.0, solver="liblinear", C=float(p.get("C", 1.0)),
+                max_iter=2000, random_state=rs,
+            )
+        if name == "logistic_elasticnet":
+            return name, LogisticRegression(
+                solver="saga",
+                C=float(p.get("C", 1.0)),
+                l1_ratio=float(p.get("l1_ratio", 0.5)),
+                max_iter=3000,
+                random_state=rs,
+            )
+        return name, LogisticRegression(
+            l1_ratio=0.0, C=float(p.get("C", 1.0)), max_iter=2000, random_state=rs
+        )
+    if name == "knn":
+        return name, KNeighborsClassifier(
+            n_neighbors=int(p.get("n", 5)),
+            weights=p.get("w", "uniform"),
+            metric=p.get("metric", "euclidean"),
+        )
+    if name == "decision_tree":
+        return name, DecisionTreeClassifier(
+            max_depth=_nullable_int(p.get("depth")),
+            min_samples_leaf=int(p.get("leaf", 1)),
+            random_state=rs,
+        )
     if name == "catboost":
         from catboost import CatBoostClassifier
+
         return name, CatBoostClassifier(
-            iterations=600, depth=6, learning_rate=0.05,
-            verbose=0, random_seed=rs, allow_writing_files=False,
+            iterations=int(p.get("iter", 300)),
+            depth=int(p.get("d", 4)),
+            learning_rate=float(p.get("lr", 0.05)),
+            l2_leaf_reg=float(p.get("l2", 1.0)),
+            verbose=0,
+            random_seed=rs,
+            allow_writing_files=False,
         )
     if name == "lightgbm":
         import lightgbm as lgb
+
         return name, lgb.LGBMClassifier(
-            n_estimators=400, num_leaves=31, random_state=rs, verbosity=-1
+            n_estimators=int(p.get("n", 200)),
+            num_leaves=int(p.get("leaves", 31)),
+            learning_rate=float(p.get("lr", 0.05)),
+            min_child_samples=int(p.get("mc", 5)),
+            random_state=rs,
+            verbosity=-1,
+            n_jobs=-1,
         )
     if name == "xgboost":
         import xgboost as xgb
+
         return name, xgb.XGBClassifier(
-            n_estimators=400, max_depth=5, random_state=rs, verbosity=0
+            n_estimators=int(p.get("n", 200)),
+            max_depth=int(p.get("d", 3)),
+            learning_rate=float(p.get("lr", 0.05)),
+            subsample=float(p.get("sub", 0.8)),
+            random_state=rs,
+            verbosity=0,
+            n_jobs=-1,
+            eval_metric="logloss",
         )
     return name, LogisticRegression(max_iter=2000, random_state=rs)
-
-
-def _oof_predict_proba(
-    model: Any,
-    df: pd.DataFrame,
-    cfg: DictConfig,
-) -> np.ndarray:
-    builder = FeatureBuilder()
-    y = df[builder.cfg.target_col]
-    n_splits = int(cfg.experiment.n_splits)
-    rs = int(cfg.experiment.random_state)
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=rs)
-    oof = np.zeros(len(df))
-    fkw = _feature_kwargs(cfg)
-    mode = cfg.features.mode
-
-    for train_idx, val_idx in skf.split(df, y):
-        fold = builder.build_fold(df, train_idx, val_idx, mode, **fkw)
-        m = clone(model)
-        m.fit(fold.X_train, fold.y_train)
-        if hasattr(m, "predict_proba"):
-            proba = m.predict_proba(fold.X_val)[:, 1]
-        else:
-            proba = m.decision_function(fold.X_val)
-            proba = (proba - proba.min()) / (proba.max() - proba.min() + 1e-9)
-        oof[val_idx] = proba
-    return oof
 
 
 def _add_ensemble_result(
@@ -1060,11 +1076,10 @@ def run_ensembles(cfg: DictConfig, tracker: ResultsTracker) -> None:
         return
     df = FeatureBuilder().read_raw(cfg.paths.train_csv)
     y = df[FeatureBuilder().cfg.target_col].values
-    rs = _rs(cfg)
     fkw = _feature_kwargs(cfg)
     methods = list(cfg.ensemble.methods)
 
-    print("\n=== Ensembles (p.4): diverse + rules ===")
+    print("\n=== Ensembles: diverse + rules ===")
     print(f"  Base models: {[n for n, _ in build_diverse_estimators(cfg)]}")
     print(f"  Feature mode: {cfg.ensemble.get('feature_mode', cfg.features.mode)}")
 
@@ -1110,102 +1125,8 @@ def run_ensembles(cfg: DictConfig, tracker: ResultsTracker) -> None:
             rule_acc=rule_acc,
         )
 
-    lb = tracker.leaderboard(top=int(cfg.ensemble.top_k))
-    if lb.empty:
-        print("\n  Legacy ensembles skipped (no prior CV leaderboard).")
-        return
 
-    estimators: list[tuple[str, Any]] = []
-    cv_rows = pd.DataFrame(tracker.rows)
-    cv_only = cv_rows[cv_rows["stage"] == "cv"] if not cv_rows.empty else cv_rows
-    source = cv_only if not cv_only.empty else cv_rows
-    if source.empty:
-        print("\n  Legacy ensembles skipped (no CV rows).")
-        return
-    top = source.sort_values("val_acc_mean", ascending=False).head(int(cfg.ensemble.top_k))
-    for _, row in top.iterrows():
-        name, est = _build_estimator_from_row(row.to_dict(), cfg)
-        estimators.append((f"{name}_{len(estimators)}", est))
-
-    print(f"\n=== Legacy ensembles (top-{len(estimators)} from CV) ===")
-
-    if "average" in methods:
-        probs = np.column_stack(
-            [_oof_predict_proba(est, df, cfg) for _, est in estimators]
-        )
-        oof_pred = (probs.mean(axis=1) >= 0.5).astype(int)
-        acc = float(accuracy_score(y, oof_pred))
-        print(f"  average OOF acc: {acc:.4f}")
-        tracker.add(
-            ModelResult("ensemble_average", str(len(estimators)), 5, acc, 0.0, [acc],
-                        stage="ensemble"),
-        )
-
-    if "voting" in methods:
-        vote = VotingClassifier(estimators=estimators, voting="soft")
-        res = cross_validate_model(
-            vote, df, cfg, name="ensemble_voting", params="soft", stage="ensemble"
-        )
-        tracker.add(res)
-        print(f"  voting CV: {res.val_acc_mean:.4f}")
-
-    if "stacking_lr" in methods:
-        stack = StackingClassifier(
-            estimators=estimators,
-            final_estimator=LogisticRegression(max_iter=2000, random_state=rs),
-            cv=5,
-            passthrough=False,
-        )
-        res = cross_validate_model(
-            stack, df, cfg, name="ensemble_stacking_lr", params="5-fold",
-            stage="ensemble",
-        )
-        tracker.add(res)
-        print(f"  stacking+LR CV: {res.val_acc_mean:.4f}")
-
-    if "stacking_ridge" in methods:
-        stack = StackingClassifier(
-            estimators=estimators,
-            final_estimator=RidgeClassifier(),
-            cv=5,
-            passthrough=False,
-        )
-        res = cross_validate_model(
-            stack, df, cfg, name="ensemble_stacking_ridge", params="5-fold",
-            stage="ensemble",
-        )
-        tracker.add(res)
-        print(f"  stacking+Ridge CV: {res.val_acc_mean:.4f}")
-
-
-# ---------------------------------------------------------------------------
 # Orchestration
-# ---------------------------------------------------------------------------
-
-
-def run_fold_comparison(cfg: DictConfig, tracker: ResultsTracker) -> None:
-    print("\n=== Validation: 1-fold vs 5-fold (Logistic L2) ===")
-    model = LogisticRegression(
-        penalty="l2", C=1.0, max_iter=2000, random_state=_rs(cfg)
-    )
-    compare_folds(cfg, model, "logistic_l2_fold_compare", tracker)
-
-
-def run_feature_mode_comparison(cfg: DictConfig, tracker: ResultsTracker) -> None:
-    print("\n=== Encoding comparison (Logistic L2, 5-fold) ===")
-    df = FeatureBuilder().read_raw(cfg.paths.train_csv)
-    for mode in ("baseline", "onehot", "label"):
-        cfg_mode = OmegaConf.merge(cfg, {"features": {"mode": mode}})
-        res = cross_validate_model(
-            LogisticRegression(penalty="l2", C=1.0, max_iter=2000, random_state=_rs(cfg)),
-            df,
-            cfg_mode,
-            name=f"encoding_{mode}",
-            params="logistic_l2",
-            stage="encoding_compare",
-        )
-        tracker.add(res, feature_mode=mode)
-        print(f"  {mode}: {res.val_acc_mean:.4f} +/- {res.val_acc_std:.4f}")
 
 
 def run_pipeline(cfg: DictConfig, stage: str) -> None:
@@ -1216,14 +1137,12 @@ def run_pipeline(cfg: DictConfig, stage: str) -> None:
 
     if stage in ("validation", "all"):
         run_validation_suite(cfg, tracker)
-        run_fold_comparison(cfg, tracker)
-        run_feature_mode_comparison(cfg, tracker)
 
     if stage in ("models", "all"):
         run_all_models(cfg, tracker)
 
     if stage in ("tune", "all") and cfg.tune.enabled:
-        from tune import run_optuna_studies
+        from ml.tune import run_optuna_studies
 
         tune_results = run_optuna_studies(cfg)
         for row in tune_results:
@@ -1247,7 +1166,7 @@ def run_pipeline(cfg: DictConfig, stage: str) -> None:
         tracker.leaderboard()
 
     if stage in ("submit", "all"):
-        from create_submission import create_submission
+        from ml.create_submission import create_submission
 
         create_submission(cfg, tracker)
 
@@ -1268,6 +1187,8 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    from config import load_config
+
     args = parse_args()
     config = load_config(args.config)
     if args.quick:

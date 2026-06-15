@@ -11,7 +11,7 @@ import optuna
 import pandas as pd
 from omegaconf import DictConfig, OmegaConf
 from sklearn.metrics import accuracy_score
-from feature_engineering import FeatureBuilder
+from ml.feature_engineering import FeatureBuilder
 
 
 def _study_name(model_name: str) -> str:
@@ -45,9 +45,10 @@ def build_objective(
     )
 
     def objective(trial: optuna.Trial) -> float:
-        from main import iter_cv_splits
+        from ml.main import _feature_kwargs, iter_cv_splits
 
         model = _sample_model(trial, model_name, cfg)
+        fkw = _feature_kwargs(cfg)
         fold_scores: list[float] = []
         for split in iter_cv_splits(y, cfg_tune, tune_scheme):
             fold = builder.build_fold(
@@ -55,12 +56,7 @@ def build_objective(
                 split.train_idx,
                 split.val_idx,
                 feature_cfg.mode,
-                scale=feature_cfg.scale,
-                drop_constant=feature_cfg.drop_constant,
-                drop_correlated=feature_cfg.drop_correlated,
-                correlated_threshold=feature_cfg.correlated_threshold,
-                clip_outliers=feature_cfg.clip_outliers,
-                outlier_iqr=feature_cfg.outlier_iqr,
+                **fkw,
             )
             model.fit(fold.X_train, fold.y_train)
             pred = model.predict(fold.X_val)
@@ -269,15 +265,7 @@ def run_optuna_studies(
     return results
 
 
-def load_config(config_path: str | Path | None = None) -> DictConfig:
-    root = Path(__file__).resolve().parent
-    path = Path(config_path) if config_path else root / "config.yaml"
-    cfg = OmegaConf.load(path)
-    if not isinstance(cfg, DictConfig):
-        raise TypeError(f"Config root must be a mapping, got {type(cfg).__name__}")
-    OmegaConf.resolve(cfg)
-    return cfg
-
-
 if __name__ == "__main__":
+    from config import load_config
+
     run_optuna_studies(load_config())

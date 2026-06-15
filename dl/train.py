@@ -14,7 +14,6 @@ from torch.utils.data import DataLoader, Dataset
 from omegaconf import DictConfig
 
 from config import (
-    DEFAULT_EXPERIMENT,
     FeatureMode,
     fold_seed,
     load_config,
@@ -24,17 +23,14 @@ from config import (
     train_config_label,
     with_train_overrides,
 )
-from feature_engineering import (
+from dl.feature_engineering import (
     BaselineFoldData,
     EmbeddingFoldData,
     FeatureBuilder,
     OneHotFoldData,
-    load_baseline_xy,
 )
 
-# ---------------------------------------------------------------------------
 # Datasets
-# ---------------------------------------------------------------------------
 
 
 class MatrixDataset(Dataset):
@@ -83,9 +79,7 @@ class TabularDataset(Dataset):
         return self.cat[idx], self.num[idx]
 
 
-# ---------------------------------------------------------------------------
 # Models
-# ---------------------------------------------------------------------------
 
 
 class TitanicMLP(nn.Module):
@@ -137,9 +131,7 @@ class TitanicEmbeddingMLP(nn.Module):
         return self.mlp(torch.cat(parts + [num_x], dim=1))
 
 
-# ---------------------------------------------------------------------------
 # Training loop
-# ---------------------------------------------------------------------------
 
 
 def _forward(model: nn.Module, batch, device: torch.device):
@@ -266,9 +258,7 @@ def _step_scheduler(scheduler, val_loss: float) -> None:
         scheduler.step()
 
 
-# ---------------------------------------------------------------------------
 # Fold preparation
-# ---------------------------------------------------------------------------
 
 
 def _train_dataloader(
@@ -460,9 +450,7 @@ def train_fold(
     return last_val_loss, last_val_acc, epoch
 
 
-# ---------------------------------------------------------------------------
 # Cross-validation & grid search
-# ---------------------------------------------------------------------------
 
 _MODE_LABELS = {
     FeatureMode.BASELINE: "baseline (6 feat)",
@@ -479,7 +467,7 @@ def stratified_kfold_cv(
     train_config: DictConfig | None = None,
     verbose_folds: bool = False,
 ) -> dict:
-    exp = experiment or DEFAULT_EXPERIMENT
+    exp = experiment if experiment is not None else load_config()
     path = data_path or str(exp.paths.train_csv)
     mode = resolve_feature_mode(feature_mode, exp)
     train_cfg = train_config or exp.train
@@ -566,7 +554,7 @@ def get_loaders(
     feature_mode: FeatureMode | str | None = None,
 ):
     """Один stratified train/val split для быстрых экспериментов."""
-    exp = experiment or DEFAULT_EXPERIMENT
+    exp = experiment if experiment is not None else load_config()
     path = data_path or str(exp.paths.train_csv)
     mode = resolve_feature_mode(feature_mode, exp)
     batch_size = exp.train.batch_size
@@ -627,7 +615,7 @@ def get_loaders(
 def default_hyperparameter_grid(
     experiment: DictConfig | None = None,
 ) -> list[DictConfig]:
-    exp = experiment or DEFAULT_EXPERIMENT
+    exp = experiment if experiment is not None else load_config()
     base = with_train_overrides(
         exp, max_epochs=80, early_stopping_patience=10
     )
@@ -650,7 +638,7 @@ def hyperparameter_grid_search(
     feature_mode: FeatureMode | str | None = None,
     configs: list[DictConfig] | None = None,
 ) -> list[dict]:
-    exp = experiment or DEFAULT_EXPERIMENT
+    exp = experiment if experiment is not None else load_config()
     mode = resolve_feature_mode(feature_mode, exp)
     configs = configs or default_hyperparameter_grid(exp)
 
@@ -685,12 +673,10 @@ def hyperparameter_grid_search(
     return results
 
 
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    exp = DEFAULT_EXPERIMENT
+    exp = load_config()
     set_seed(exp.random_state)
     train_cfg = exp.train
     mode = resolve_feature_mode(None, exp)
