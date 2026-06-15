@@ -33,15 +33,7 @@ def build_objective(
     )
     cfg_tune = OmegaConf.merge(
         cfg,
-        {
-            "validation": {
-                "n_splits": int(
-                    cfg.validation.get("tune_n_splits", cfg.tune.get("cv_folds", 5))
-                    if "validation" in cfg
-                    else cfg.tune.get("cv_folds", 5)
-                ),
-            }
-        },
+        {"validation": {"n_splits": int(cfg.cv.n_splits)}},
     )
 
     def objective(trial: optuna.Trial) -> float:
@@ -220,8 +212,11 @@ def build_model_from_params(
 def run_optuna_studies(
     cfg: DictConfig,
     df: pd.DataFrame | None = None,
+    *,
+    model_names: list[str] | None = None,
+    n_trials: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Запуск Optuna для моделей из cfg.tune.models."""
+    """Запуск Optuna для моделей из cfg.tune.models (или model_names)."""
     builder = FeatureBuilder()
     if df is None:
         df = builder.read_raw(str(cfg.paths.train_csv))
@@ -229,20 +224,26 @@ def run_optuna_studies(
     out_dir = Path(cfg.paths.tune_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    models = list(model_names) if model_names else list(cfg.tune.models)
+    allowed = {"catboost", "lightgbm", "xgboost", "random_forest"}
+    unknown = set(models) - allowed
+    if unknown:
+        raise ValueError(f"Unsupported tune models: {sorted(unknown)}")
+
     results: list[dict[str, Any]] = []
-    n_trials = int(cfg.tune.n_trials)
+    n_trials_val = n_trials if n_trials is not None else int(cfg.tune.n_trials)
     timeout = cfg.tune.get("timeout_sec")
     timeout = None if timeout is None else int(timeout)
 
-    for model_name in cfg.tune.models:
-        print(f"\n=== Optuna: {model_name} ({n_trials} trials) ===")
+    for model_name in models:
+        print(f"\n=== Optuna: {model_name} ({n_trials_val} trials) ===")
         study = optuna.create_study(
             direction="maximize",
             study_name=_study_name(model_name),
         )
         study.optimize(
             build_objective(model_name, df, cfg),
-            n_trials=n_trials,
+            n_trials=n_trials_val,
             timeout=timeout,
             show_progress_bar=True,
         )
@@ -266,6 +267,25 @@ def run_optuna_studies(
 
 
 if __name__ == "__main__":
+    import argparse
+
+    import bootstrap  # noqa: F401
+
     from config import load_config
 
-    run_optuna_studies(load_config())
+    parser = argparse.ArgumentParser(description="ML Optuna hyperparameter tuning")
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=None,
+        choices=["catboost", "lightgbm", "xgboost", "random_forest"],
+        help="Модели для тюнинга (по умолчанию — tune.models из config)",
+    )
+    parser.add_argument("--n-trials", type=int, default=None)
+    args = parser.parse_args()
+
+    run_optuna_studies(
+        load_config(),
+        model_names=args.models,
+        n_trials=args.n_trials,
+    )

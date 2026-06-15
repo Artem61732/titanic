@@ -22,7 +22,10 @@ pip install -r requirements.txt
 | ML: ансамбли | `python -m ml.main --stage ensemble` |
 | ML: сабмит | `python -m ml.create_submission` |
 | ML: тюнинг Optuna | `python -m ml.tune` |
-| DL: CV / grid search | `python -m dl.train` |
+| ML: тюнинг (выбор моделей) | `python -m ml.tune --models catboost lightgbm --n-trials 50` |
+| DL: CV | `python -m dl.main` |
+| DL: CV + grid / cosine | `python -m dl.main --grid --cosine` |
+| DL: тюнинг Optuna | `python -m dl.tune --n-trials 20` |
 | DL: сабмит | `python -m dl.create_submission` |
 | DL: сабмит через `main.py` | `python main.py --pipeline dl` |
 
@@ -35,7 +38,9 @@ pip install -r requirements.txt
 ```bash
 python main.py --quick                              # быстрый ML-прогон
 python -m ml.main --stage models --quick
-python -m ml.main --stage tune
+python -m ml.tune --models catboost --n-trials 10
+python -m dl.main --modes onehot embedding
+python -m dl.tune --n-trials 10 --n-splits 3
 python -m ml.main --stage submit
 python -m dl.create_submission --mode embedding
 python -m dl.create_submission train.lr=0.001 feature_mode=embedding
@@ -51,10 +56,11 @@ Makefile: `make install`, `make run`, `make run-quick`, `make run-dl`.
 | `outputs/ml/results.csv` | все CV-результаты |
 | `outputs/ml/results.json` | то же в JSON |
 | `outputs/ml/tune/` | best params после Optuna |
+| `outputs/dl/best_params.json` | лучшие гиперпараметры DNN |
 | `submission.csv` | ML-сабмит |
 | `submission_dl.csv` | DL-сабмит |
 
-Метрика — accuracy на stratified K-fold (`experiment.n_splits`, по умолчанию 5). Актуальные цифры смотри в `results.csv` после прогона; на полном гриде Random Forest обычно ~0.844–0.845.
+Метрика — accuracy на stratified K-fold (`cv.n_splits`, по умолчанию 5). Актуальные цифры смотри в `results.csv` после прогона; на полном гриде Random Forest обычно ~0.844–0.845.
 
 ## Структура
 
@@ -74,6 +80,8 @@ titanic/
 │   ├── feature_engineering.py
 │   └── config.yaml
 └── dl/
+    ├── main.py
+    ├── tune.py
     ├── train.py
     ├── create_submission.py
     ├── feature_engineering.py  # матрицы для MLP; FE — из ml/
@@ -90,7 +98,7 @@ titanic/
 |------|------------|
 | `config.yaml` | `paths`, `random_state`, `cv` |
 | `ml/config.yaml` | модели, validation, tune, ensemble, submission |
-| `dl/config.yaml` | `train.*`, `feature_mode`, `val_size` |
+| `dl/config.yaml` | `train.*`, `feature_mode`, `tune`, `val_size` |
 
 Сабмит по умолчанию — `ensemble_diverse_voting` (`ml/config.yaml` → `submission.model`).
 

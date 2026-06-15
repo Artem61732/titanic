@@ -18,7 +18,10 @@ train:
   amp_dtype: fp16 # fp16 | bf16
 
 feature_mode: onehot # baseline | onehot | embedding
-n_splits: 5
 val_size: 0.2
-# Единый seed: sklearn split/k-fold, веса PyTorch, shuffle батчей (см. config.set_seed)
-random_state: 42
+
+tune:
+  n_trials: 20
+  n_epochs: 50
+  patience: 8
+  search_space: refined # refined | wide

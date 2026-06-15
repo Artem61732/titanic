@@ -9,6 +9,8 @@ DATA_DIR = ROOT / "data"
 OUTPUTS_DIR = ROOT / "outputs"
 ML_OUTPUTS_DIR = OUTPUTS_DIR / "ml"
 DL_OUTPUTS_DIR = OUTPUTS_DIR / "dl"
+ML_BEST_PARAMS_PATH = ML_OUTPUTS_DIR / "best_params.json"
+DL_BEST_PARAMS_PATH = DL_OUTPUTS_DIR / "best_params.json"
 
 
 def resolve_path(path: str | Path) -> Path:

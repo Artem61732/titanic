@@ -676,20 +676,6 @@ def hyperparameter_grid_search(
 # CLI
 
 if __name__ == "__main__":
-    exp = load_config()
-    set_seed(exp.random_state)
-    train_cfg = exp.train
-    mode = resolve_feature_mode(None, exp)
-    mode_label = _MODE_LABELS.get(mode, mode.value)
+    from dl.main import evaluate_dnn_experiments
 
-    print(f"1) {mode_label} + plateau + early stopping (from config.yaml)")
-    stratified_kfold_cv(exp, train_config=train_cfg)
-
-    print(f"\n2) {mode_label} + cosine scheduler")
-    stratified_kfold_cv(
-        exp,
-        train_config=with_train_overrides(exp, scheduler="cosine").train,
-    )
-
-    print(f"\n3) hyperparameter grid ({mode.value})")
-    hyperparameter_grid_search(exp)
+    evaluate_dnn_experiments(run_cosine=True, run_grid=True)

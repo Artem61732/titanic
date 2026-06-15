@@ -2,16 +2,13 @@
 # Пути к данным и артефактам — в корневом config.yaml
 
 experiment:
-  random_state: 42
-  n_splits: 5
   compare_n_splits: [1, 5]
   metric: accuracy
-  quick: false # true — меньше моделей/гридов для smoke-test
+  quick: false
 
 # п.3 — валидация ближе к LB: repeated CV, hold-out, калибровка
 validation:
   enabled: true
-  n_splits: 5
   n_repeats: 10 # RepeatedStratifiedKFold = n_repeats × n_splits оценок
   holdout_size: 0.2
   target_survival_rate: null # null → доля Survived=1 в train (~0.384)
@@ -19,9 +16,7 @@ validation:
   schemes: [kfold]
   save_report: true
   report_path: outputs/validation_report.json
-  # для Optuna оставляем быстрый kfold (50 fold-fit на trial = долго)
   tune_scheme: kfold
-  tune_n_splits: 5
 
 features:
   # baseline: расширенный FE (Age по Title+Pclass, IsWoman/Child, Ticket, Surname rate)
@@ -85,7 +80,6 @@ tune:
   n_trials: 40
   timeout_sec: null
   models: [catboost, lightgbm, xgboost, random_forest]
-  cv_folds: 5
 
 ensemble:
   enabled: true

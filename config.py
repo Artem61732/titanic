@@ -54,6 +54,7 @@ def load_config(
 
     _resolve_paths(cfg)
     _sync_path_aliases(cfg)
+    _sync_shared_settings(cfg)
     OmegaConf.resolve(cfg)
     ensure_output_dirs()
     return cfg
@@ -77,6 +78,27 @@ def _sync_path_aliases(cfg: DictConfig) -> None:
             paths[right] = paths[left]
         elif right in paths and left not in paths:
             paths[left] = paths[right]
+
+
+def _sync_shared_settings(cfg: DictConfig) -> None:
+    """random_state и cv.n_splits — только в корневом config.yaml."""
+    rs = int(cfg.get("random_state", 42))
+    n_splits = int(OmegaConf.select(cfg, "cv.n_splits", default=5))
+
+    cfg.random_state = rs
+    cfg.n_splits = n_splits
+
+    if "experiment" not in cfg:
+        cfg.experiment = OmegaConf.create({})
+    cfg.experiment.random_state = rs
+    cfg.experiment.n_splits = n_splits
+
+    if "validation" in cfg:
+        cfg.validation.n_splits = n_splits
+        cfg.validation.tune_n_splits = n_splits
+
+    if "tune" in cfg:
+        cfg.tune.cv_folds = n_splits
 
 
 def fold_seed(base: int, fold: int = 0) -> int:
