@@ -62,6 +62,16 @@ Makefile: `make install`, `make run`, `make run-quick`, `make run-dl`.
 
 Метрика — accuracy на stratified K-fold (`cv.n_splits`, по умолчанию 5). Актуальные цифры смотри в `results.csv` после прогона; на полном гриде Random Forest обычно ~0.844–0.845.
 
+## Результаты
+
+| Метрика | ML | DL |
+|---------|----|----|
+| Модель | `ensemble_diverse_voting` (onehot) | `TitanicMLP` (onehot) |
+| CV (5-fold acc) | 0.8328 ± 0.0241 | 0.8451 ± 0.0085 |
+| Kaggle public LB | 0.77033 | 0.77033 |
+| Доля «выжил» в сабмите | 39.2% | 34.5% |
+| Различий между сабмитами | — | 42 / 418 |
+
 ## Структура
 
 ```
