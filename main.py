@@ -7,6 +7,9 @@ Titanic — единая точка входа.
 
 По умолчанию запускается ML-пайплайн:
   загрузка данных -> препроцессинг -> CV -> таблица результатов -> submission.csv
+
+  python main.py --pipeline dl   — DL CV + submission_dl.csv
+  python main.py --pipeline all  — ML full + DL CV + submission_dl.csv
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ def parse_args() -> argparse.Namespace:
         "--pipeline",
         choices=("ml", "dl", "all"),
         default="ml",
-        help="ml (default): full ML pipeline; dl: neural net submission; all: both",
+        help="ml (default): full ML pipeline; dl: DL CV + submission; all: ML full + DL CV + submission",
     )
     parser.add_argument(
         "--quick",
@@ -54,7 +57,12 @@ def run_ml_pipeline(cfg, *, quick: bool) -> None:
 
 def run_dl_pipeline(cfg) -> None:
     from dl.create_submission import create_submission
+    from dl.main import evaluate_dnn_experiments
 
+    print("=== DL CV ===")
+    evaluate_dnn_experiments()
+
+    print("\n=== DL submission ===")
     create_submission(
         experiment=cfg,
         output_path=cfg.paths.get("dl_submission_csv", cfg.paths.submission_csv),
@@ -72,7 +80,10 @@ def main() -> int:
         run_ml_pipeline(project_cfg, quick=args.quick)
 
     if args.pipeline in ("dl", "all"):
-        print("\n=== DL submission ===")
+        if args.pipeline == "dl":
+            print("=== DL pipeline ===")
+        else:
+            print("\n=== DL pipeline ===")
         run_dl_pipeline(project_cfg)
 
     print("\nDone.")

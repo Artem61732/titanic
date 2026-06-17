@@ -27,7 +27,7 @@ pip install -r requirements.txt
 | DL: CV + grid / cosine | `python -m dl.main --grid --cosine` |
 | DL: тюнинг Optuna | `python -m dl.tune --n-trials 20` |
 | DL: сабмит | `python -m dl.create_submission` |
-| DL: сабмит через `main.py` | `python main.py --pipeline dl` |
+| DL: CV + сабмит | `python main.py --pipeline dl` |
 
 Сабмиты: `submission.csv` (ML), `submission_dl.csv` (DL).
 
@@ -44,10 +44,13 @@ python -m dl.tune --n-trials 10 --n-splits 3
 python -m ml.main --stage submit
 python -m dl.create_submission --mode embedding
 python -m dl.create_submission train.lr=0.001 feature_mode=embedding
-python main.py --pipeline all                       # ML + DL
+python main.py --pipeline all                       # ML full + DL CV + submit
 ```
 
-Makefile: `make install`, `make run`, `make run-quick`, `make run-dl`.
+`python main.py --pipeline dl` — DL CV (`python -m dl.main`) и сабмит.  
+`python main.py --pipeline all` — полный ML-пайплайн + DL CV + сабмит.
+
+Makefile: `make install`, `make run`, `make run-quick`, `make run-dl` (DL CV + submit).
 
 ## Артефакты
 
