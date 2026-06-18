@@ -18,6 +18,7 @@ pip install -r requirements.txt
 | ML: ансамбли | `python -m ml.main --stage ensemble` |
 | ML: сабмит | `python -m ml.create_submission` |
 | ML: тюнинг Optuna | `python -m ml.tune` |
+| ML: форс-перетюнинг (игнор cached params) | `python -m ml.tune --force` |
 | ML: тюнинг (выбор моделей) | `python -m ml.tune --models catboost lightgbm --n-trials 50` |
 | DL: CV | `python -m dl.main` |
 | DL: CV + grid / cosine | `python -m dl.main --grid --cosine` |
@@ -27,7 +28,9 @@ pip install -r requirements.txt
 
 Сабмиты: `submission.csv` (ML), `submission_dl.csv` (DL).
 
-Модели для Optuna задаются в `ml/config.yaml` → `tune.models`. Сабмит по умолчанию — `ensemble_diverse_voting` (`submission.model`).
+Модели для Optuna задаются в `ml/config.yaml` → `tune.models`.  
+Best params хранятся в Git в `artifacts/ml/tune/` и по умолчанию переиспользуются (`tune.use_saved: true`).  
+Сабмит по умолчанию — `ensemble_diverse_voting` (`submission.model`).
 
 Примеры:
 
@@ -54,7 +57,7 @@ Makefile: `make install`, `make run`, `make run-quick`, `make run-dl` (DL CV + s
 |------|----------|
 | `outputs/ml/results.csv` | все CV-результаты |
 | `outputs/ml/results.json` | то же в JSON |
-| `outputs/ml/tune/` | best params после Optuna |
+| `artifacts/ml/tune/` | versioned best params Optuna (`*_best.json`, `tune_summary.json`) |
 | `outputs/dl/best_params.json` | лучшие гиперпараметры DNN |
 | `submission.csv` | ML-сабмит |
 | `submission_dl.csv` | DL-сабмит |

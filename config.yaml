@@ -16,7 +16,7 @@ paths:
   submission_csv: submission.csv
   dl_submission_csv: submission_dl.csv
   results_dir: outputs/ml
-  tune_dir: outputs/ml/tune
+  tune_dir: artifacts/ml/tune
 
 random_state: 42
 

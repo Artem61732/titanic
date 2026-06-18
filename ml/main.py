@@ -1144,7 +1144,10 @@ def run_pipeline(cfg: DictConfig, stage: str) -> None:
     if stage in ("tune", "all") and cfg.tune.enabled:
         from ml.tune import run_optuna_studies
 
-        tune_results = run_optuna_studies(cfg)
+        tune_results = run_optuna_studies(
+            cfg,
+            use_saved=bool(cfg.tune.get("use_saved", True)),
+        )
         for row in tune_results:
             tracker.add(
                 ModelResult(

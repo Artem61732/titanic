@@ -18,6 +18,33 @@ def _study_name(model_name: str) -> str:
     return f"titanic_{model_name}"
 
 
+def _summary_path(cfg: DictConfig) -> Path:
+    return Path(cfg.paths.tune_dir) / "tune_summary.json"
+
+
+def load_saved_tune_results(
+    cfg: DictConfig,
+    model_names: list[str] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Загрузить сохранённые результаты тюнинга из tune_summary.json."""
+    summary_path = _summary_path(cfg)
+    if not summary_path.exists():
+        return None
+
+    with summary_path.open(encoding="utf-8") as f:
+        rows = json.load(f)
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    requested = list(model_names) if model_names else list(cfg.tune.models)
+    by_model = {str(r.get("model")): r for r in rows if isinstance(r, dict)}
+    missing = [m for m in requested if m not in by_model]
+    if missing:
+        return None
+
+    return [by_model[m] for m in requested]
+
+
 def build_objective(
     model_name: str,
     df: pd.DataFrame,
@@ -215,6 +242,7 @@ def run_optuna_studies(
     *,
     model_names: list[str] | None = None,
     n_trials: int | None = None,
+    use_saved: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Запуск Optuna для моделей из cfg.tune.models (или model_names)."""
     builder = FeatureBuilder()
@@ -229,6 +257,17 @@ def run_optuna_studies(
     unknown = set(models) - allowed
     if unknown:
         raise ValueError(f"Unsupported tune models: {sorted(unknown)}")
+
+    use_saved_flag = (
+        bool(cfg.tune.get("use_saved", True))
+        if use_saved is None
+        else bool(use_saved)
+    )
+    if use_saved_flag:
+        cached = load_saved_tune_results(cfg, model_names=models)
+        if cached is not None:
+            print(f"\nUsing cached tune results: {_summary_path(cfg)}")
+            return cached
 
     results: list[dict[str, Any]] = []
     n_trials_val = n_trials if n_trials is not None else int(cfg.tune.n_trials)
@@ -282,10 +321,16 @@ if __name__ == "__main__":
         help="Модели для тюнинга (по умолчанию — tune.models из config)",
     )
     parser.add_argument("--n-trials", type=int, default=None)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Игнорировать сохранённые best params и запустить Optuna заново",
+    )
     args = parser.parse_args()
 
     run_optuna_studies(
         load_config(),
         model_names=args.models,
         n_trials=args.n_trials,
+        use_saved=not args.force,
     )

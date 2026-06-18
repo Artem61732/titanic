@@ -77,6 +77,7 @@ models:
 
 tune:
   enabled: true
+  use_saved: true # если есть tune_summary.json — не перезапускать Optuna
   n_trials: 40
   timeout_sec: null
   models: [catboost, lightgbm, xgboost, random_forest]
@@ -109,7 +110,7 @@ ensemble:
 
 submission:
   # logistic_l2 | tuned | ensemble_diverse_voting | ensemble_diverse_rule_blend | rule_only
-  model: ensemble_diverse_voting
+  model: tuned
   feature_mode: null # null → ensemble.feature_mode (onehot для ансамбля)
   logistic:
     penalty: l2 # l2 | l1 | elasticnet

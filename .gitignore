@@ -37,7 +37,7 @@ desktop.ini
 .env.*
 
 # --- Generated (ml/ & dl/) ---
-# Pipeline outputs: EDA plots, CV results, Optuna best params
+# Pipeline outputs: EDA plots, CV results (best params moved to artifacts/)
 **/outputs/
 outputs/
 
